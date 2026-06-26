@@ -736,15 +736,31 @@ class PDFMergerPro:
             if ed.kind in ("delete", "replace"):
                 if ed.bbox:
                     rect = fitz.Rect(*ed.bbox)
-                    fitz_page.draw_rect(rect, color=ed.bg, fill=ed.bg, width=0)
+                    # Extend whiteout rect to cover potential overflow
+                    page_rect = fitz_page.rect
+                    extended = fitz.Rect(
+                        max(page_rect.x0, rect.x0 - 2),
+                        max(page_rect.y0, rect.y0 - 2),
+                        min(page_rect.x1, rect.x1 + 2),
+                        min(page_rect.y1, rect.y1 + 2),
+                    )
+                    fitz_page.draw_rect(extended, color=ed.bg, fill=ed.bg, width=0)
             if ed.kind in ("add", "replace"):
                 if ed.bbox and ed.text:
                     rect = fitz.Rect(*ed.bbox)
+                    # Ensure rect is tall enough for the font (at least 1.5× font size)
+                    min_h = ed.size * 1.5
+                    if rect.height < min_h:
+                        rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + min_h)
                     try:
-                        fitz_page.insert_textbox(
+                        rc = fitz_page.insert_textbox(
                             rect, ed.text, fontname=ed.font, fontsize=ed.size,
                             color=ed.color, align=0)
+                        # rc < 0 means text didn't fit — fall back to insert_text
+                        if rc < 0:
+                            raise ValueError("text overflow")
                     except Exception:
+                        # insert_text never clips: baseline at y0 + size
                         fitz_page.insert_text(
                             (rect.x0, rect.y0 + ed.size), ed.text,
                             fontname=ed.font, fontsize=ed.size, color=ed.color)
