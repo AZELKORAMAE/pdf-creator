@@ -15,6 +15,9 @@ from pathlib import Path
 import threading
 import copy
 import io
+import subprocess
+import tempfile
+import os
 
 try:
     import fitz
@@ -173,6 +176,11 @@ class PDFMergerPro:
                   relief="flat", activebackground=C["warn"],
                   activeforeground=C["white"], cursor="hand2", padx=14, pady=5
                   ).pack(side=tk.RIGHT, padx=18, pady=10)
+        tk.Button(hdr, text="🖨  Imprimer", command=self.print_document,
+                  font=("Helvetica", 9, "bold"), bg=C["blue"], fg=C["white"],
+                  relief="flat", activebackground=C["blue_h"],
+                  activeforeground=C["white"], cursor="hand2", padx=14, pady=5
+                  ).pack(side=tk.RIGHT, padx=4, pady=10)
         tk.Button(hdr, text="✕  Tout vider", command=self.clear_all,
                   font=("Helvetica", 9), bg="#1A3560", fg="#A8CCE8",
                   relief="flat", cursor="hand2", padx=10, pady=5
@@ -668,6 +676,17 @@ class PDFMergerPro:
         self._snapshot()
         self._st(f"✔  Modifications enregistrées ({len(edits)} édit(s))", ok=True)
 
+    # ── Print ──
+    def print_document(self):
+        if not self.pages:
+            messagebox.showwarning("Vide", "Ajoutez des fichiers PDF d'abord.")
+            return
+        if not HAS_FITZ:
+            messagebox.showerror("Module manquant",
+                "L'impression nécessite PyMuPDF :\npip install PyMuPDF")
+            return
+        PrintDialog(self)
+
     # ── Merge ──
     def merge_pdfs(self):
         if not self.pages:
@@ -948,8 +967,15 @@ class PageEditor:
         sp.pack(side=tk.LEFT, padx=8)
         sp.bind("<KeyRelease>", self._on_text_change)
 
+        # Palette de couleurs rapide (swatches cliquables)
+        PALETTE = [
+            "#000000", "#434343", "#666666", "#999999", "#CCCCCC", "#FFFFFF",
+            "#FF0000", "#FF4500", "#FF8C00", "#FFD700", "#ADFF2F", "#008000",
+            "#00CED1", "#1E90FF", "#0000CD", "#8A2BE2", "#FF69B4", "#8B4513",
+        ]
+
         rowc = tk.Frame(inner, bg=C["white"])
-        rowc.pack(fill=tk.X, pady=(0, 10))
+        rowc.pack(fill=tk.X, pady=(0, 4))
         tk.Label(rowc, text="Couleur texte :", font=("Helvetica", 8, "bold"),
                  bg=C["white"], fg=C["text"]).pack(side=tk.LEFT)
         self.color_text = (0, 0, 0)
@@ -961,8 +987,22 @@ class PageEditor:
                   highlightthickness=1, highlightbackground=C["line"],
                   cursor="hand2", padx=6).pack(side=tk.LEFT)
 
+        # Palette rapide couleur texte
+        pal_text = tk.Frame(inner, bg=C["white"])
+        pal_text.pack(fill=tk.X, pady=(0, 10))
+        for i, hex_col in enumerate(PALETTE):
+            r = int(hex_col[1:3], 16) / 255
+            g = int(hex_col[3:5], 16) / 255
+            b = int(hex_col[5:7], 16) / 255
+            btn = tk.Frame(pal_text, width=16, height=16, bg=hex_col,
+                           highlightthickness=1, highlightbackground="#888",
+                           cursor="hand2")
+            btn.grid(row=i // 9, column=i % 9, padx=1, pady=1)
+            btn.bind("<Button-1>",
+                lambda e, n=(r, g, b), h=hex_col: self._apply_color("text", n, h))
+
         rowb = tk.Frame(inner, bg=C["white"])
-        rowb.pack(fill=tk.X, pady=(0, 14))
+        rowb.pack(fill=tk.X, pady=(0, 4))
         tk.Label(rowb, text="Couleur de fond :", font=("Helvetica", 8, "bold"),
                  bg=C["white"], fg=C["text"]).pack(side=tk.LEFT)
         self.color_bg = (1, 1, 1)
@@ -973,6 +1013,21 @@ class PageEditor:
                   font=("Helvetica", 8), bg=C["white"], relief="flat",
                   highlightthickness=1, highlightbackground=C["line"],
                   cursor="hand2", padx=6).pack(side=tk.LEFT)
+
+        # Palette rapide couleur fond
+        pal_bg = tk.Frame(inner, bg=C["white"])
+        pal_bg.pack(fill=tk.X, pady=(0, 6))
+        for i, hex_col in enumerate(PALETTE):
+            r = int(hex_col[1:3], 16) / 255
+            g = int(hex_col[3:5], 16) / 255
+            b = int(hex_col[5:7], 16) / 255
+            btn = tk.Frame(pal_bg, width=16, height=16, bg=hex_col,
+                           highlightthickness=1, highlightbackground="#888",
+                           cursor="hand2")
+            btn.grid(row=i // 9, column=i % 9, padx=1, pady=1)
+            btn.bind("<Button-1>",
+                lambda e, n=(r, g, b), h=hex_col: self._apply_color("bg", n, h))
+
         tk.Label(inner, text="(efface le texte d'origine)",
                  font=("Helvetica", 7, "italic"),
                  bg=C["white"], fg=C["mid"], anchor="w").pack(fill=tk.X)
@@ -1012,6 +1067,20 @@ class PageEditor:
         self.btn_apply.config(state=state)
         self.btn_revert.config(state=state)
 
+    def _apply_color(self, which, normalized, hexv):
+        """Applique une couleur choisie (depuis palette ou chooser) immédiatement."""
+        if which == "text":
+            self.color_text = normalized
+            self.swatch_text.config(bg=hexv)
+        else:
+            self.color_bg = normalized
+            self.swatch_bg.config(bg=hexv)
+        # Apply immediately without throttle
+        if self._realtime_after:
+            self.win.after_cancel(self._realtime_after)
+            self._realtime_after = None
+        self._do_realtime_update()
+
     def _pick_color(self, which):
         cur = self.color_text if which == "text" else self.color_bg
         hex_cur = "#{:02x}{:02x}{:02x}".format(
@@ -1019,13 +1088,7 @@ class PageEditor:
         rgb, hexv = colorchooser.askcolor(color=hex_cur, parent=self.win)
         if rgb:
             normalized = (rgb[0]/255, rgb[1]/255, rgb[2]/255)
-            if which == "text":
-                self.color_text = normalized
-                self.swatch_text.config(bg=hexv)
-            else:
-                self.color_bg = normalized
-                self.swatch_bg.config(bg=hexv)
-            self._on_text_change()
+            self._apply_color(which, normalized, hexv)
 
     def _set_mode(self, mode):
         self._mode = mode
@@ -1796,6 +1859,12 @@ class PageEditor:
             state="normal" if self._hist_idx < len(self._hist) - 1 else "disabled")
 
     def _on_save(self):
+        # Commit any pending real-time edit before saving
+        if self._realtime_after:
+            self.win.after_cancel(self._realtime_after)
+            self._realtime_after = None
+        if self._editing_bbox is not None:
+            self._do_realtime_update()
         self.app.on_editor_save(self.pos, self.rotation, self.edits)
         self._doc.close()
         self.win.destroy()
@@ -1808,6 +1877,420 @@ class PageEditor:
                 return
         self._doc.close()
         self.win.destroy()
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  PRINT DIALOG  — style PDFCreator
+# ══════════════════════════════════════════════════════════════════════════════
+class PrintDialog:
+    """Dialogue d'impression complet : choix imprimante, format, orientation,
+    copies, plage de pages — comme PDFCreator."""
+
+    PAPER_SIZES = {
+        "A4 (210×297 mm)":    "A4",
+        "A3 (297×420 mm)":    "A3",
+        "A5 (148×210 mm)":    "A5",
+        "Letter (216×279 mm)": "Letter",
+        "Legal (216×356 mm)":  "Legal",
+        "Tabloid (279×432 mm)":"Tabloid",
+    }
+
+    def __init__(self, app):
+        self.app = app
+        self._tmp_pdf = None
+        self.win = tk.Toplevel(app.root)
+        self.win.title("Imprimer")
+        self.win.geometry("680x560")
+        self.win.resizable(False, False)
+        self.win.configure(bg=C["bg"])
+        self.win.transient(app.root)
+        self.win.grab_set()
+        self._build_ui()
+        self._load_printers()
+
+    def _build_ui(self):
+        # ── Header ──
+        hdr = tk.Frame(self.win, bg=C["navy2"], height=50)
+        hdr.pack(fill=tk.X)
+        hdr.pack_propagate(False)
+        tk.Frame(hdr, bg=C["blue"], width=4).pack(side=tk.LEFT, fill=tk.Y)
+        tk.Label(hdr, text="🖨  Imprimer", font=("Helvetica", 14, "bold"),
+                 fg=C["white"], bg=C["navy2"], padx=16).pack(side=tk.LEFT, pady=8)
+        info = f"{len(self.app.pages)} page(s) au total"
+        tk.Label(hdr, text=info, font=("Helvetica", 9),
+                 fg="#A8CCE8", bg=C["navy2"]).pack(side=tk.LEFT)
+
+        body = tk.Frame(self.win, bg=C["bg"])
+        body.pack(fill=tk.BOTH, expand=True, padx=16, pady=12)
+
+        # ── Colonne gauche ──
+        left = tk.Frame(body, bg=C["bg"])
+        left.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=(0, 8))
+
+        # -- Section Imprimante --
+        self._section(left, "🖨  Imprimante")
+        prow = tk.Frame(left, bg=C["bg"])
+        prow.pack(fill=tk.X, pady=(4, 0))
+        self.var_printer = tk.StringVar(value="Chargement…")
+        self.cb_printer = ttk.Combobox(prow, textvariable=self.var_printer,
+                                       state="readonly", font=("Helvetica", 9), width=30)
+        self.cb_printer.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Button(prow, text="⟳", command=self._load_printers,
+                  font=("Helvetica", 9), bg=C["white"], relief="flat",
+                  highlightthickness=1, highlightbackground=C["line"],
+                  cursor="hand2", padx=6).pack(side=tk.LEFT, padx=(4, 0))
+        self.lbl_printer_status = tk.Label(left, text="",
+                                           font=("Helvetica", 8, "italic"),
+                                           bg=C["bg"], fg=C["mid"], anchor="w")
+        self.lbl_printer_status.pack(fill=tk.X, pady=(2, 8))
+
+        # -- Section Mise en page --
+        self._section(left, "📄  Mise en page")
+        pgrow = tk.Frame(left, bg=C["bg"])
+        pgrow.pack(fill=tk.X, pady=(4, 8))
+        tk.Label(pgrow, text="Format :", font=("Helvetica", 8),
+                 bg=C["bg"], fg=C["text"]).pack(side=tk.LEFT)
+        self.var_paper = tk.StringVar(value="A4 (210×297 mm)")
+        ttk.Combobox(pgrow, textvariable=self.var_paper,
+                     values=list(self.PAPER_SIZES.keys()),
+                     state="readonly", font=("Helvetica", 9), width=22
+                     ).pack(side=tk.LEFT, padx=8)
+
+        orrow = tk.Frame(left, bg=C["bg"])
+        orrow.pack(fill=tk.X, pady=(0, 8))
+        tk.Label(orrow, text="Orientation :", font=("Helvetica", 8),
+                 bg=C["bg"], fg=C["text"]).pack(side=tk.LEFT)
+        self.var_orient = tk.StringVar(value="portrait")
+        tk.Radiobutton(orrow, text="Portrait", variable=self.var_orient,
+                       value="portrait", font=("Helvetica", 9),
+                       bg=C["bg"], fg=C["text"], cursor="hand2"
+                       ).pack(side=tk.LEFT, padx=(8, 4))
+        tk.Radiobutton(orrow, text="Paysage", variable=self.var_orient,
+                       value="landscape", font=("Helvetica", 9),
+                       bg=C["bg"], fg=C["text"], cursor="hand2"
+                       ).pack(side=tk.LEFT, padx=4)
+
+        # -- Section Copies --
+        self._section(left, "📋  Copies")
+        cprow = tk.Frame(left, bg=C["bg"])
+        cprow.pack(fill=tk.X, pady=(4, 8))
+        tk.Label(cprow, text="Nombre de copies :", font=("Helvetica", 8),
+                 bg=C["bg"], fg=C["text"]).pack(side=tk.LEFT)
+        self.var_copies = tk.IntVar(value=1)
+        tk.Spinbox(cprow, from_=1, to=99, textvariable=self.var_copies,
+                   width=5, font=("Helvetica", 9)
+                   ).pack(side=tk.LEFT, padx=8)
+        self.var_collate = tk.BooleanVar(value=True)
+        tk.Checkbutton(cprow, text="Assembler", variable=self.var_collate,
+                       font=("Helvetica", 9), bg=C["bg"], fg=C["text"],
+                       cursor="hand2").pack(side=tk.LEFT, padx=8)
+
+        # -- Section Plage de pages --
+        self._section(left, "🔢  Plage de pages")
+        self.var_range = tk.StringVar(value="all")
+        rall = tk.Frame(left, bg=C["bg"])
+        rall.pack(fill=tk.X, pady=(4, 2))
+        tk.Radiobutton(rall, text="Toutes les pages", variable=self.var_range,
+                       value="all", font=("Helvetica", 9),
+                       bg=C["bg"], fg=C["text"], cursor="hand2",
+                       command=self._on_range_change).pack(side=tk.LEFT)
+        rcur = tk.Frame(left, bg=C["bg"])
+        rcur.pack(fill=tk.X, pady=2)
+        tk.Radiobutton(rcur, text="Page sélectionnée", variable=self.var_range,
+                       value="current", font=("Helvetica", 9),
+                       bg=C["bg"], fg=C["text"], cursor="hand2",
+                       command=self._on_range_change).pack(side=tk.LEFT)
+        rcust = tk.Frame(left, bg=C["bg"])
+        rcust.pack(fill=tk.X, pady=2)
+        tk.Radiobutton(rcust, text="Plage :", variable=self.var_range,
+                       value="custom", font=("Helvetica", 9),
+                       bg=C["bg"], fg=C["text"], cursor="hand2",
+                       command=self._on_range_change).pack(side=tk.LEFT)
+        self.var_from = tk.IntVar(value=1)
+        self.var_to   = tk.IntVar(value=max(1, len(self.app.pages)))
+        self.spin_from = tk.Spinbox(rcust, from_=1, to=max(1, len(self.app.pages)),
+                                    textvariable=self.var_from,
+                                    width=5, font=("Helvetica", 9), state="disabled")
+        self.spin_from.pack(side=tk.LEFT, padx=6)
+        tk.Label(rcust, text="à", font=("Helvetica", 8),
+                 bg=C["bg"], fg=C["text"]).pack(side=tk.LEFT)
+        self.spin_to = tk.Spinbox(rcust, from_=1, to=max(1, len(self.app.pages)),
+                                  textvariable=self.var_to,
+                                  width=5, font=("Helvetica", 9), state="disabled")
+        self.spin_to.pack(side=tk.LEFT, padx=6)
+
+        # ── Colonne droite : aperçu + options avancées ──
+        right = tk.Frame(body, bg=C["white"], width=180,
+                         highlightthickness=1, highlightbackground=C["line"])
+        right.pack(side=tk.RIGHT, fill=tk.Y)
+        right.pack_propagate(False)
+        tk.Label(right, text="Aperçu", font=("Helvetica", 8, "bold"),
+                 bg=C["navy"], fg=C["white"], pady=6).pack(fill=tk.X)
+        self.preview_canvas = tk.Canvas(right, bg="#e0e0e0", width=160, height=200,
+                                        highlightthickness=0)
+        self.preview_canvas.pack(padx=10, pady=10)
+        self._draw_preview()
+
+        tk.Label(right, text="Options", font=("Helvetica", 8, "bold"),
+                 bg=C["navy"], fg=C["white"], pady=4).pack(fill=tk.X)
+        opt = tk.Frame(right, bg=C["white"])
+        opt.pack(fill=tk.X, padx=10, pady=6)
+        self.var_color_mode = tk.StringVar(value="color")
+        tk.Radiobutton(opt, text="Couleur", variable=self.var_color_mode,
+                       value="color", font=("Helvetica", 8),
+                       bg=C["white"], cursor="hand2").pack(anchor="w")
+        tk.Radiobutton(opt, text="Niveaux de gris", variable=self.var_color_mode,
+                       value="gray", font=("Helvetica", 8),
+                       bg=C["white"], cursor="hand2").pack(anchor="w")
+        tk.Frame(opt, bg=C["line"], height=1).pack(fill=tk.X, pady=6)
+        self.var_duplex = tk.BooleanVar(value=False)
+        tk.Checkbutton(opt, text="Recto-verso", variable=self.var_duplex,
+                       font=("Helvetica", 8), bg=C["white"], cursor="hand2").pack(anchor="w")
+        self.var_fit = tk.BooleanVar(value=True)
+        tk.Checkbutton(opt, text="Ajuster à la page", variable=self.var_fit,
+                       font=("Helvetica", 8), bg=C["white"], cursor="hand2").pack(anchor="w")
+        tk.Frame(opt, bg=C["line"], height=1).pack(fill=tk.X, pady=6)
+        tk.Label(opt, text="Qualité :", font=("Helvetica", 8),
+                 bg=C["white"], fg=C["text"]).pack(anchor="w")
+        self.var_quality = tk.StringVar(value="Normale")
+        ttk.Combobox(opt, textvariable=self.var_quality,
+                     values=["Brouillon", "Normale", "Haute"],
+                     state="readonly", font=("Helvetica", 8), width=14
+                     ).pack(anchor="w", pady=(2, 0))
+
+        # ── Footer : boutons ──
+        ft = tk.Frame(self.win, bg=C["navy2"], height=52)
+        ft.pack(fill=tk.X, side=tk.BOTTOM)
+        ft.pack_propagate(False)
+        self.lbl_status = tk.Label(ft, text="", font=("Helvetica", 8),
+                                   fg="#A8CCE8", bg=C["navy2"], padx=14)
+        self.lbl_status.pack(side=tk.LEFT, pady=10)
+        tk.Button(ft, text="✕  Annuler", command=self._cancel,
+                  font=("Helvetica", 9), bg="#1A3560", fg="#A8CCE8",
+                  relief="flat", cursor="hand2", padx=12, pady=5
+                  ).pack(side=tk.RIGHT, padx=10, pady=10)
+        self.btn_print = tk.Button(ft, text="🖨  Imprimer",
+                  command=self._do_print,
+                  font=("Helvetica", 9, "bold"), bg=C["blue"], fg=C["white"],
+                  relief="flat", activebackground=C["blue_h"],
+                  cursor="hand2", padx=16, pady=5)
+        self.btn_print.pack(side=tk.RIGHT, padx=4, pady=10)
+
+    def _section(self, parent, title):
+        frm = tk.Frame(parent, bg=C["bg2"],
+                       highlightthickness=1, highlightbackground=C["line"])
+        frm.pack(fill=tk.X, pady=(8, 2))
+        tk.Label(frm, text=title, font=("Helvetica", 8, "bold"),
+                 bg=C["bg2"], fg=C["navy"], padx=8, pady=3).pack(side=tk.LEFT)
+
+    def _draw_preview(self):
+        self.preview_canvas.delete("all")
+        w, h = 160, 200
+        orient = self.var_orient.get() if hasattr(self, "var_orient") else "portrait"
+        if orient == "landscape":
+            pw, ph = int(w * 0.85), int(h * 0.65)
+        else:
+            pw, ph = int(w * 0.65), int(h * 0.85)
+        ox = (w - pw) // 2
+        oy = (h - ph) // 2
+        # Shadow
+        self.preview_canvas.create_rectangle(ox+4, oy+4, ox+pw+4, oy+ph+4,
+                                             fill="#aaa", outline="")
+        # Page
+        self.preview_canvas.create_rectangle(ox, oy, ox+pw, oy+ph,
+                                             fill="white", outline="#333", width=1)
+        # Texte simulé
+        for i in range(5):
+            lw = int(pw * (0.5 + 0.4 * ((i * 37) % 10) / 10))
+            ly = oy + 20 + i * 14
+            self.preview_canvas.create_line(ox+10, ly, ox+10+lw, ly,
+                                            fill="#ccc", width=3)
+
+    def _on_range_change(self):
+        state = "normal" if self.var_range.get() == "custom" else "disabled"
+        self.spin_from.config(state=state)
+        self.spin_to.config(state=state)
+
+    def _load_printers(self):
+        self.var_printer.set("Chargement…")
+        self.lbl_printer_status.config(text="Recherche des imprimantes…", fg=C["mid"])
+        self.win.after(100, self._do_load_printers)
+
+    def _do_load_printers(self):
+        printers = self._get_printers()
+        default = self._get_default_printer()
+        self.cb_printer["values"] = printers
+        if default and default in printers:
+            self.var_printer.set(default)
+            self.lbl_printer_status.config(
+                text=f"Imprimante par défaut : {default}", fg=C["ok"])
+        elif printers:
+            self.var_printer.set(printers[0])
+            self.lbl_printer_status.config(
+                text=f"{len(printers)} imprimante(s) disponible(s)", fg=C["ok"])
+        else:
+            self.var_printer.set("Aucune imprimante détectée")
+            self.lbl_printer_status.config(
+                text="⚠ Aucune imprimante trouvée — vérifiez CUPS", fg=C["warn"])
+
+    def _get_printers(self):
+        try:
+            r = subprocess.run(["lpstat", "-p"], capture_output=True, text=True, timeout=5)
+            printers = []
+            for line in r.stdout.splitlines():
+                if line.startswith("printer ") or line.startswith("imprimante "):
+                    parts = line.split()
+                    if len(parts) > 1:
+                        printers.append(parts[1])
+            if printers:
+                return printers
+        except Exception:
+            pass
+        # Fallback: try lpstat -a
+        try:
+            r = subprocess.run(["lpstat", "-a"], capture_output=True, text=True, timeout=5)
+            printers = []
+            for line in r.stdout.splitlines():
+                parts = line.split()
+                if parts:
+                    printers.append(parts[0])
+            if printers:
+                return printers
+        except Exception:
+            pass
+        return []
+
+    def _get_default_printer(self):
+        try:
+            r = subprocess.run(["lpstat", "-d"], capture_output=True, text=True, timeout=5)
+            for line in r.stdout.splitlines():
+                if ":" in line:
+                    return line.split(":", 1)[1].strip()
+        except Exception:
+            pass
+        return None
+
+    def _cancel(self):
+        if self._tmp_pdf and os.path.exists(self._tmp_pdf):
+            try:
+                os.unlink(self._tmp_pdf)
+            except Exception:
+                pass
+        self.win.destroy()
+
+    def _do_print(self):
+        printer = self.var_printer.get()
+        if not printer or printer in ("Chargement…", "Aucune imprimante détectée"):
+            messagebox.showwarning("Imprimante", "Sélectionnez une imprimante valide.",
+                                   parent=self.win)
+            return
+
+        self.btn_print.config(state="disabled", text="⏳  Impression…")
+        self.lbl_status.config(text="Génération du PDF temporaire…", fg="#A8CCE8")
+        self.win.update()
+
+        # Generate temp PDF
+        try:
+            tmp = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+            tmp.close()
+            self._tmp_pdf = tmp.name
+
+            out_doc = fitz.open()
+            src_docs = {}
+            pages_to_print = self._get_pages_to_print()
+            for idx in pages_to_print:
+                page = self.app.pages[idx]
+                if page.path not in src_docs:
+                    src_docs[page.path] = fitz.open(page.path)
+                src = src_docs[page.path]
+                out_doc.insert_pdf(src, from_page=page.pg_idx, to_page=page.pg_idx)
+                new_pg = out_doc[-1]
+                self.app._apply_edits(new_pg, page.edits)
+                if page.rotation:
+                    new_pg.set_rotation(page.rotation)
+            out_doc.save(self._tmp_pdf, garbage=4, deflate=True)
+            out_doc.close()
+            for d in src_docs.values():
+                d.close()
+        except Exception as e:
+            messagebox.showerror("Erreur", f"Impossible de générer le PDF :\n{e}",
+                                 parent=self.win)
+            self.btn_print.config(state="normal", text="🖨  Imprimer")
+            return
+
+        # Build lp command
+        cmd = ["lp"]
+        cmd += ["-d", printer]
+        copies = max(1, self.var_copies.get())
+        cmd += ["-n", str(copies)]
+        paper = self.PAPER_SIZES.get(self.var_paper.get(), "A4")
+        cmd += ["-o", f"media={paper}"]
+        orient = self.var_orient.get()
+        # orientation-requested: 3=portrait, 4=landscape
+        cmd += ["-o", "orientation-requested=3" if orient == "portrait"
+                else "orientation-requested=4"]
+        if self.var_collate.get() and copies > 1:
+            cmd += ["-o", "Collate=True"]
+        if self.var_duplex.get():
+            cmd += ["-o", "sides=two-sided-long-edge"]
+        if self.var_fit.get():
+            cmd += ["-o", "fit-to-page"]
+        if self.var_color_mode.get() == "gray":
+            cmd += ["-o", "ColorModel=Gray"]
+        quality_map = {"Brouillon": "draft", "Normale": "normal", "Haute": "high"}
+        q = quality_map.get(self.var_quality.get(), "normal")
+        cmd += ["-o", f"print-quality={q}"]
+        cmd += [self._tmp_pdf]
+
+        self.lbl_status.config(text="Envoi vers l'imprimante…", fg="#A8CCE8")
+        self.win.update()
+
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            if result.returncode == 0:
+                job_id = result.stdout.strip()
+                self.lbl_status.config(
+                    text=f"✔  Tâche envoyée  {job_id}", fg=C["ok"])
+                self.win.update()
+                messagebox.showinfo(
+                    "Impression lancée",
+                    f"Document envoyé à : {printer}\n"
+                    f"Pages : {len(pages_to_print)}  ·  Copies : {copies}\n"
+                    f"Format : {self.var_paper.get()}\n\n{job_id}",
+                    parent=self.win)
+                self._cancel()
+            else:
+                err = result.stderr.strip() or result.stdout.strip()
+                messagebox.showerror("Erreur d'impression",
+                                     f"lp a retourné une erreur :\n{err}",
+                                     parent=self.win)
+                self.btn_print.config(state="normal", text="🖨  Imprimer")
+                self.lbl_status.config(text="⚠  Erreur", fg=C["warn"])
+        except FileNotFoundError:
+            messagebox.showerror(
+                "lp introuvable",
+                "La commande 'lp' n'est pas disponible.\n"
+                "Installez CUPS : sudo apt install cups",
+                parent=self.win)
+            self.btn_print.config(state="normal", text="🖨  Imprimer")
+        except subprocess.TimeoutExpired:
+            messagebox.showerror("Timeout",
+                                 "L'impression a pris trop de temps.",
+                                 parent=self.win)
+            self.btn_print.config(state="normal", text="🖨  Imprimer")
+
+    def _get_pages_to_print(self):
+        mode = self.var_range.get()
+        n = len(self.app.pages)
+        if mode == "all":
+            return list(range(n))
+        elif mode == "current":
+            sel = self.app._selected
+            return [sel] if sel is not None and 0 <= sel < n else list(range(n))
+        else:  # custom
+            frm = max(1, self.var_from.get()) - 1
+            to  = min(n, self.var_to.get())
+            return list(range(frm, to))
 
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
