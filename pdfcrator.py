@@ -176,11 +176,8 @@ class PDFMergerPro:
                   relief="flat", activebackground=C["warn"],
                   activeforeground=C["white"], cursor="hand2", padx=14, pady=5
                   ).pack(side=tk.RIGHT, padx=18, pady=10)
-        tk.Button(hdr, text="🖨  Imprimer", command=self.print_document,
-                  font=("Helvetica", 9, "bold"), bg=C["blue"], fg=C["white"],
-                  relief="flat", activebackground=C["blue_h"],
-                  activeforeground=C["white"], cursor="hand2", padx=14, pady=5
-                  ).pack(side=tk.RIGHT, padx=4, pady=10)
+        # Bouton impression désactivé temporairement
+        # tk.Button(hdr, text="🖨  Imprimer", command=self.print_document, ...).pack(...)
         tk.Button(hdr, text="✕  Tout vider", command=self.clear_all,
                   font=("Helvetica", 9), bg="#1A3560", fg="#A8CCE8",
                   relief="flat", cursor="hand2", padx=10, pady=5
