@@ -746,25 +746,32 @@ class PDFMergerPro:
         return (1.0, 1.0, 1.0)
 
     def _apply_edits(self, fitz_page, edits):
+        # Pass 1: mark all delete/replace zones as redactions so original text
+        # is physically removed from the PDF (copy-paste gives new text only).
+        page_rect = fitz_page.rect
+        redact_bboxes = set()
         for ed in edits:
-            if ed.kind in ("delete", "replace"):
-                if ed.bbox:
-                    # Use explicit bg color or auto-detect page background
-                    fill = ed.bg if ed.bg is not None else self._sample_page_bg(fitz_page, ed.bbox)
-                    rect = fitz.Rect(*ed.bbox)
-                    # Extend whiteout rect to cover potential overflow
-                    page_rect = fitz_page.rect
-                    extended = fitz.Rect(
-                        max(page_rect.x0, rect.x0 - 2),
-                        max(page_rect.y0, rect.y0 - 2),
-                        min(page_rect.x1, rect.x1 + 2),
-                        min(page_rect.y1, rect.y1 + 2),
-                    )
-                    fitz_page.draw_rect(extended, color=fill, fill=fill, width=0)
+            if ed.kind in ("delete", "replace") and ed.bbox:
+                rect = fitz.Rect(*ed.bbox)
+                extended = fitz.Rect(
+                    max(page_rect.x0, rect.x0 - 2),
+                    max(page_rect.y0, rect.y0 - 2),
+                    min(page_rect.x1, rect.x1 + 2),
+                    min(page_rect.y1, rect.y1 + 2),
+                )
+                fill = ed.bg if ed.bg is not None else self._sample_page_bg(fitz_page, ed.bbox)
+                # fill=(r,g,b) paints the redacted area with the background color
+                fitz_page.add_redact_annot(extended, fill=fill)
+                redact_bboxes.add(id(ed))
+        if redact_bboxes:
+            # apply_redactions removes text/images under the redact annotations
+            fitz_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
+
+        # Pass 2: insert new text for replace and add edits
+        for ed in edits:
             if ed.kind in ("add", "replace"):
                 if ed.bbox and ed.text:
                     rect = fitz.Rect(*ed.bbox)
-                    # Ensure rect is tall enough for the font (at least 1.5× font size)
                     min_h = ed.size * 1.5
                     if rect.height < min_h:
                         rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + min_h)
@@ -772,11 +779,9 @@ class PDFMergerPro:
                         rc = fitz_page.insert_textbox(
                             rect, ed.text, fontname=ed.font, fontsize=ed.size,
                             color=ed.color, align=0)
-                        # rc < 0 means text didn't fit — fall back to insert_text
                         if rc < 0:
                             raise ValueError("text overflow")
                     except Exception:
-                        # insert_text never clips: baseline at y0 + size
                         fitz_page.insert_text(
                             (rect.x0, rect.y0 + ed.size), ed.text,
                             fontname=ed.font, fontsize=ed.size, color=ed.color)
