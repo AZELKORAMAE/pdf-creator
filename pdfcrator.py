@@ -728,10 +728,29 @@ class PDFMergerPro:
             self._st("⚠  Erreur lors de la fusion", warn=True)
             messagebox.showerror("Erreur de fusion", str(e))
 
+    def _sample_page_bg(self, fitz_page, bbox):
+        """Sample the background color of the page just above bbox."""
+        try:
+            x0, y0, x1, y1 = bbox
+            sx = (x0 + x1) / 2
+            sy = max(0, y0 - 2)
+            pix = fitz_page.get_pixmap(
+                matrix=fitz.Matrix(2, 2),
+                clip=fitz.Rect(sx - 1, sy - 1, sx + 1, sy + 1))
+            if pix.samples and len(pix.samples) >= 3:
+                return (pix.samples[0] / 255.0,
+                        pix.samples[1] / 255.0,
+                        pix.samples[2] / 255.0)
+        except Exception:
+            pass
+        return (1.0, 1.0, 1.0)
+
     def _apply_edits(self, fitz_page, edits):
         for ed in edits:
             if ed.kind in ("delete", "replace"):
-                if ed.bbox and ed.bg is not None:
+                if ed.bbox:
+                    # Use explicit bg color or auto-detect page background
+                    fill = ed.bg if ed.bg is not None else self._sample_page_bg(fitz_page, ed.bbox)
                     rect = fitz.Rect(*ed.bbox)
                     # Extend whiteout rect to cover potential overflow
                     page_rect = fitz_page.rect
@@ -741,7 +760,7 @@ class PDFMergerPro:
                         min(page_rect.x1, rect.x1 + 2),
                         min(page_rect.y1, rect.y1 + 2),
                     )
-                    fitz_page.draw_rect(extended, color=ed.bg, fill=ed.bg, width=0)
+                    fitz_page.draw_rect(extended, color=fill, fill=fill, width=0)
             if ed.kind in ("add", "replace"):
                 if ed.bbox and ed.text:
                     rect = fitz.Rect(*ed.bbox)
@@ -1227,10 +1246,15 @@ class PageEditor:
                 continue
             x0, y0, x1, y1 = [v * self._scale for v in ed.bbox]
 
-            # Whiteout pour delete et replace (skip if bg is None = transparent)
-            if ed.kind in ("delete", "replace") and ed.bg is not None:
+            # Whiteout pour delete et replace
+            if ed.kind in ("delete", "replace"):
+                if ed.bg is not None:
+                    fill_color = ed.bg
+                else:
+                    # Auto-detect page background to erase old text invisibly
+                    fill_color = self._get_canvas_bg_at(ed.bbox)
                 bg_hex = "#{:02x}{:02x}{:02x}".format(
-                    int(ed.bg[0]*255), int(ed.bg[1]*255), int(ed.bg[2]*255))
+                    int(fill_color[0]*255), int(fill_color[1]*255), int(fill_color[2]*255))
                 self.canvas.create_rectangle(x0, y0, x1, y1,
                     fill=bg_hex, outline="", tags="edit_overlay")
 
@@ -1666,6 +1690,23 @@ class PageEditor:
             pass
         self.color_bg = (1, 1, 1)
         self.swatch_bg.config(bg="#FFFFFF")
+
+    def _get_canvas_bg_at(self, bbox):
+        """Sample the PDF page background color just above bbox for transparent overlay."""
+        try:
+            x0, y0, x1, y1 = bbox
+            sx = (x0 + x1) / 2
+            sy = max(0, y0 - 2)
+            pix = self._fpg.get_pixmap(
+                matrix=fitz.Matrix(2, 2),
+                clip=fitz.Rect(sx - 1, sy - 1, sx + 1, sy + 1))
+            if pix.samples and len(pix.samples) >= 3:
+                return (pix.samples[0] / 255.0,
+                        pix.samples[1] / 255.0,
+                        pix.samples[2] / 255.0)
+        except Exception:
+            pass
+        return (1.0, 1.0, 1.0)
 
     def _on_no_bg_change(self):
         """Called when the 'no background' checkbox changes."""
