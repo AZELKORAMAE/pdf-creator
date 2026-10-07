@@ -729,18 +729,38 @@ class PDFMergerPro:
             messagebox.showerror("Erreur de fusion", str(e))
 
     def _sample_page_bg(self, fitz_page, bbox):
-        """Sample the background color of the page just above bbox."""
+        """Sample the background color by probing multiple points around the bbox.
+        We sample at the four outer corners and just outside each edge to avoid
+        sampling on top of the text itself, then return the median color."""
         try:
             x0, y0, x1, y1 = bbox
-            sx = (x0 + x1) / 2
-            sy = max(0, y0 - 2)
-            pix = fitz_page.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
-                clip=fitz.Rect(sx - 1, sy - 1, sx + 1, sy + 1))
-            if pix.samples and len(pix.samples) >= 3:
-                return (pix.samples[0] / 255.0,
-                        pix.samples[1] / 255.0,
-                        pix.samples[2] / 255.0)
+            pr = fitz_page.rect
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            # Probe points: outside the four edges + four outer corners
+            probes = [
+                (x0 - 3, my),       # left of bbox
+                (x1 + 3, my),       # right of bbox
+                (mx,     y0 - 3),   # above bbox
+                (mx,     y1 + 3),   # below bbox
+                (x0 - 3, y0 - 3),   # top-left corner
+                (x1 + 3, y0 - 3),   # top-right corner
+                (x0 - 3, y1 + 3),   # bottom-left corner
+                (x1 + 3, y1 + 3),   # bottom-right corner
+            ]
+            samples = []
+            for px, py in probes:
+                px = max(pr.x0 + 1, min(pr.x1 - 1, px))
+                py = max(pr.y0 + 1, min(pr.y1 - 1, py))
+                pix = fitz_page.get_pixmap(
+                    matrix=fitz.Matrix(1, 1),
+                    clip=fitz.Rect(px - 1, py - 1, px + 1, py + 1))
+                if pix.samples and len(pix.samples) >= 3:
+                    samples.append((pix.samples[0], pix.samples[1], pix.samples[2]))
+            if samples:
+                # Median per channel (robust against outliers like text pixels)
+                samples.sort(key=lambda s: s[0] + s[1] + s[2])
+                mid = samples[len(samples) // 2]
+                return (mid[0] / 255.0, mid[1] / 255.0, mid[2] / 255.0)
         except Exception:
             pass
         return (1.0, 1.0, 1.0)
@@ -1697,18 +1717,30 @@ class PageEditor:
         self.swatch_bg.config(bg="#FFFFFF")
 
     def _get_canvas_bg_at(self, bbox):
-        """Sample the PDF page background color just above bbox for transparent overlay."""
+        """Sample the PDF page background color around bbox for transparent overlay."""
         try:
             x0, y0, x1, y1 = bbox
-            sx = (x0 + x1) / 2
-            sy = max(0, y0 - 2)
-            pix = self._fpg.get_pixmap(
-                matrix=fitz.Matrix(2, 2),
-                clip=fitz.Rect(sx - 1, sy - 1, sx + 1, sy + 1))
-            if pix.samples and len(pix.samples) >= 3:
-                return (pix.samples[0] / 255.0,
-                        pix.samples[1] / 255.0,
-                        pix.samples[2] / 255.0)
+            pr = self._fpg.rect
+            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
+            probes = [
+                (x0 - 3, my), (x1 + 3, my),
+                (mx, y0 - 3), (mx, y1 + 3),
+                (x0 - 3, y0 - 3), (x1 + 3, y0 - 3),
+                (x0 - 3, y1 + 3), (x1 + 3, y1 + 3),
+            ]
+            samples = []
+            for px, py in probes:
+                px = max(pr.x0 + 1, min(pr.x1 - 1, px))
+                py = max(pr.y0 + 1, min(pr.y1 - 1, py))
+                pix = self._fpg.get_pixmap(
+                    matrix=fitz.Matrix(1, 1),
+                    clip=fitz.Rect(px - 1, py - 1, px + 1, py + 1))
+                if pix.samples and len(pix.samples) >= 3:
+                    samples.append((pix.samples[0], pix.samples[1], pix.samples[2]))
+            if samples:
+                samples.sort(key=lambda s: s[0] + s[1] + s[2])
+                mid = samples[len(samples) // 2]
+                return (mid[0] / 255.0, mid[1] / 255.0, mid[2] / 255.0)
         except Exception:
             pass
         return (1.0, 1.0, 1.0)
