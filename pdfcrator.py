@@ -731,7 +731,7 @@ class PDFMergerPro:
     def _apply_edits(self, fitz_page, edits):
         for ed in edits:
             if ed.kind in ("delete", "replace"):
-                if ed.bbox:
+                if ed.bbox and ed.bg is not None:
                     rect = fitz.Rect(*ed.bbox)
                     # Extend whiteout rect to cover potential overflow
                     page_rect = fitz_page.rect
@@ -804,6 +804,7 @@ class PageEditor:
         # Mode courant
         self._mode = "select"  # "select" | "add"
         self._draw_start = None
+        self._eyedropper_which = None  # "text" | "bg" | None
 
         # Édition temps réel : on garde le bbox du span en cours d'édition
         self._editing_bbox = None  # tuple (x0,y0,x1,y1) du dernier span/sélection éditée
@@ -994,11 +995,15 @@ class PageEditor:
         self.color_text = (0, 0, 0)
         self.swatch_text = tk.Frame(rowc, width=24, height=20, bg="#000000",
                                     highlightthickness=1, highlightbackground=C["line"])
-        self.swatch_text.pack(side=tk.LEFT, padx=8)
+        self.swatch_text.pack(side=tk.LEFT, padx=6)
         tk.Button(rowc, text="…", command=lambda: self._pick_color("text"),
                   font=("Helvetica", 8), bg=C["white"], relief="flat",
                   highlightthickness=1, highlightbackground=C["line"],
                   cursor="hand2", padx=6).pack(side=tk.LEFT)
+        tk.Button(rowc, text="🔍", command=lambda: self._start_eyedropper("text"),
+                  font=("Helvetica", 9), bg=C["white"], relief="flat",
+                  highlightthickness=1, highlightbackground=C["line"],
+                  cursor="hand2", padx=4).pack(side=tk.LEFT, padx=(3, 0))
 
         # Palette rapide couleur texte
         pal_text = tk.Frame(inner, bg=C["white"])
@@ -1021,15 +1026,29 @@ class PageEditor:
         self.color_bg = (1, 1, 1)
         self.swatch_bg = tk.Frame(rowb, width=24, height=20, bg="#FFFFFF",
                                   highlightthickness=1, highlightbackground=C["line"])
-        self.swatch_bg.pack(side=tk.LEFT, padx=8)
+        self.swatch_bg.pack(side=tk.LEFT, padx=6)
         tk.Button(rowb, text="…", command=lambda: self._pick_color("bg"),
                   font=("Helvetica", 8), bg=C["white"], relief="flat",
                   highlightthickness=1, highlightbackground=C["line"],
                   cursor="hand2", padx=6).pack(side=tk.LEFT)
+        tk.Button(rowb, text="🔍", command=lambda: self._start_eyedropper("bg"),
+                  font=("Helvetica", 9), bg=C["white"], relief="flat",
+                  highlightthickness=1, highlightbackground=C["line"],
+                  cursor="hand2", padx=4).pack(side=tk.LEFT, padx=(3, 0))
+
+        # Option : aucun arrière-plan (transparent)
+        nobg_row = tk.Frame(inner, bg=C["white"])
+        nobg_row.pack(fill=tk.X, pady=(2, 0))
+        self._no_bg_var = tk.BooleanVar(value=False)
+        tk.Checkbutton(nobg_row, text="Aucun arrière-plan (transparent)",
+                       variable=self._no_bg_var,
+                       font=("Helvetica", 8), bg=C["white"], fg=C["text"],
+                       cursor="hand2",
+                       command=self._on_no_bg_change).pack(side=tk.LEFT)
 
         # Palette rapide couleur fond
         pal_bg = tk.Frame(inner, bg=C["white"])
-        pal_bg.pack(fill=tk.X, pady=(0, 6))
+        pal_bg.pack(fill=tk.X, pady=(4, 6))
         for i, hex_col in enumerate(PALETTE):
             r = int(hex_col[1:3], 16) / 255
             g = int(hex_col[3:5], 16) / 255
@@ -1088,6 +1107,8 @@ class PageEditor:
         else:
             self.color_bg = normalized
             self.swatch_bg.config(bg=hexv)
+            # Selecting a bg color means we do want a background
+            self._no_bg_var.set(False)
         # Apply immediately without throttle
         if self._realtime_after:
             self.win.after_cancel(self._realtime_after)
@@ -1096,6 +1117,8 @@ class PageEditor:
 
     def _pick_color(self, which):
         cur = self.color_text if which == "text" else self.color_bg
+        if cur is None:
+            cur = (1, 1, 1)
         hex_cur = "#{:02x}{:02x}{:02x}".format(
             int(cur[0]*255), int(cur[1]*255), int(cur[2]*255))
         rgb, hexv = colorchooser.askcolor(color=hex_cur, parent=self.win)
@@ -1204,8 +1227,8 @@ class PageEditor:
                 continue
             x0, y0, x1, y1 = [v * self._scale for v in ed.bbox]
 
-            # Whiteout pour delete et replace
-            if ed.kind in ("delete", "replace"):
+            # Whiteout pour delete et replace (skip if bg is None = transparent)
+            if ed.kind in ("delete", "replace") and ed.bg is not None:
                 bg_hex = "#{:02x}{:02x}{:02x}".format(
                     int(ed.bg[0]*255), int(ed.bg[1]*255), int(ed.bg[2]*255))
                 self.canvas.create_rectangle(x0, y0, x1, y1,
@@ -1388,6 +1411,13 @@ class PageEditor:
             self.canvas.config(cursor="arrow")
 
     def _on_press(self, event):
+        # Eyedropper mode: sample pixel and return
+        if self._eyedropper_which is not None:
+            cx = self.canvas.canvasx(event.x)
+            cy = self.canvas.canvasy(event.y)
+            self._sample_pixel(cx, cy)
+            return
+
         if self._mode == "add":
             cx = self.canvas.canvasx(event.x)
             cy = self.canvas.canvasy(event.y)
@@ -1604,10 +1634,16 @@ class PageEditor:
         self.color_text = (r, g, b)
         self.swatch_text.config(bg="#{:02x}{:02x}{:02x}".format(
             int(r*255), int(g*255), int(b*255)))
-        r, g, b = ed.bg
-        self.color_bg = (r, g, b)
-        self.swatch_bg.config(bg="#{:02x}{:02x}{:02x}".format(
-            int(r*255), int(g*255), int(b*255)))
+        if ed.bg is None:
+            self._no_bg_var.set(True)
+            self.color_bg = (1, 1, 1)
+            self.swatch_bg.config(bg="#FFFFFF")
+        else:
+            self._no_bg_var.set(False)
+            r, g, b = ed.bg
+            self.color_bg = (r, g, b)
+            self.swatch_bg.config(bg="#{:02x}{:02x}{:02x}".format(
+                int(r*255), int(g*255), int(b*255)))
 
     def _detect_bg_color(self, bbox):
         try:
@@ -1630,6 +1666,45 @@ class PageEditor:
             pass
         self.color_bg = (1, 1, 1)
         self.swatch_bg.config(bg="#FFFFFF")
+
+    def _on_no_bg_change(self):
+        """Called when the 'no background' checkbox changes."""
+        if self._realtime_after:
+            self.win.after_cancel(self._realtime_after)
+            self._realtime_after = None
+        self._do_realtime_update()
+
+    def _start_eyedropper(self, which):
+        """Enter eyedropper mode: next click on canvas samples the pixel color."""
+        self._eyedropper_which = which
+        self.canvas.config(cursor="crosshair")
+        self._st_var.set("🔍  Cliquez sur la page pour prélever une couleur…")
+
+    def _sample_pixel(self, canvas_x, canvas_y):
+        """Sample the PDF pixel at the given canvas coordinates."""
+        px = canvas_x / self._scale
+        py = canvas_y / self._scale
+        try:
+            mat = fitz.Matrix(2, 2)
+            pix = self._fpg.get_pixmap(
+                matrix=mat,
+                clip=fitz.Rect(px - 0.5, py - 0.5, px + 0.5, py + 0.5))
+            if pix.samples and len(pix.samples) >= 3:
+                r = pix.samples[0] / 255.0
+                g = pix.samples[1] / 255.0
+                b = pix.samples[2] / 255.0
+                hexv = "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
+                which = self._eyedropper_which
+                self._eyedropper_which = None
+                self.canvas.config(cursor="arrow")
+                self._apply_color(which, (r, g, b), hexv)
+                self._st_var.set(f"🎨  Couleur prélevée : {hexv}")
+                return
+        except Exception:
+            pass
+        self._eyedropper_which = None
+        self.canvas.config(cursor="arrow")
+        self._st_var.set("⚠  Impossible de prélever la couleur")
 
     def _font_display_to_key(self, display):
         mapping = {
@@ -1666,6 +1741,8 @@ class PageEditor:
         except Exception:
             return
 
+        effective_bg = None if self._no_bg_var.get() else self.color_bg
+
         # Si c'est un édit 'add' sélectionné, on modifie l'édit existant
         if self._added_sel_uid is not None:
             ed = next((e for e in self.edits if e.uid == self._added_sel_uid), None)
@@ -1674,7 +1751,7 @@ class PageEditor:
                 ed.font  = font
                 ed.size  = size
                 ed.color = self.color_text
-                ed.bg    = self.color_bg
+                ed.bg    = effective_bg
                 self._redraw_overlays()
             return
 
@@ -1684,7 +1761,7 @@ class PageEditor:
         if ed is None:
             ed = Edit(
                 kind="replace", bbox=self._editing_bbox, text=new_text,
-                font=font, size=size, color=self.color_text, bg=self.color_bg,
+                font=font, size=size, color=self.color_text, bg=effective_bg,
             )
             self.edits.append(ed)
         else:
@@ -1692,7 +1769,7 @@ class PageEditor:
             ed.font  = font
             ed.size  = size
             ed.color = self.color_text
-            ed.bg    = self.color_bg
+            ed.bg    = effective_bg
         self._redraw_overlays()
 
     def _find_edit_by_bbox(self, bbox):
