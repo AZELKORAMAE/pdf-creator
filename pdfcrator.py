@@ -1275,6 +1275,7 @@ class PageEditor:
         self._bg = None
         self._tk_fams = None
         self._families = None
+        self._rot_handle = None
 
         self._doc = fitz.open(self.page.path)
         self._fpg = self._doc[self.page.pg_idx]
@@ -1513,23 +1514,12 @@ class PageEditor:
                  font=("Helvetica", 7, "italic"), bg=C["white"], fg=C["mid"],
                  anchor="w").pack(fill=tk.X)
 
-        rowa = tk.Frame(inner, bg=C["white"])
-        rowa.pack(fill=tk.X, pady=(10, 0))
-        tk.Label(rowa, text="Rotation du texte (°) :", font=("Helvetica", 8, "bold"),
-                 bg=C["white"], fg=C["text"]).pack(side=tk.LEFT)
-        self.var_angle = tk.StringVar(value="0")
-        self.sp_angle = tk.Spinbox(rowa, from_=-360, to=360, increment=15, width=6,
-                                   textvariable=self.var_angle, font=("Helvetica", 9),
-                                   command=lambda: self._on_prop("angle"))
-        self.sp_angle.pack(side=tk.LEFT, padx=6)
-        self.sp_angle.bind("<KeyRelease>", lambda e: self._on_prop("angle"))
+        tk.Label(inner, text="⟳ Rotation : glissez la poignée ronde au-dessus du texte "
+                             "sélectionné (Maj = par pas de 15°).",
+                 font=("Helvetica", 7, "italic"), bg=C["white"], fg=C["mid"],
+                 anchor="w", justify=tk.LEFT, wraplength=290).pack(fill=tk.X, pady=(10, 0))
 
         tk.Frame(inner, bg=C["line"], height=1).pack(fill=tk.X, pady=10)
-        self.btn_edit = tk.Button(inner, text="✏  Modifier ce texte", command=self._edit_or_commit,
-                                  font=("Helvetica", 9, "bold"), bg=C["ok"], fg=C["white"],
-                                  relief="flat", activebackground="#0F6238",
-                                  cursor="hand2", pady=6)
-        self.btn_edit.pack(fill=tk.X, pady=(0, 5))
         self.btn_revert = tk.Button(inner, text="↺  Rétablir le texte d'origine",
                                     command=self._revert_selected, font=("Helvetica", 8),
                                     bg=C["white"], fg=C["text"], relief="flat",
@@ -1556,7 +1546,7 @@ class PageEditor:
         self._prop_widgets = (self.cb_font, self.sp_size, self.chk_bold, self.chk_italic,
                               self.btn_text_more, self.btn_text_drop, self.rb_bg_orig,
                               self.rb_bg_color, self.btn_bg_more, self.btn_bg_drop,
-                              self.sp_angle, self.btn_edit, self.btn_revert, self.btn_delete)
+                              self.btn_revert, self.btn_delete)
 
     def _palette(self, parent, callback):
         pal = tk.Frame(parent, bg=C["white"])
@@ -1802,9 +1792,43 @@ class PageEditor:
                 self._snap()
         self._render_after = self.win.after(120, run)
 
+    def _item_quad_cv(self, item):
+        """Les 4 coins (haut-gauche, haut-droit, bas-droit, bas-gauche) du texte,
+        en tenant compte de sa rotation."""
+        ed = self._get_edit(item)
+        if ed is None and item[0] == "seg" and self._seg_by_key[item[1]]["angle"] == 0.0:
+            r = fitz.Rect(self._seg_by_key[item[1]]["bbox"])
+            pts = [r.tl, r.tr, r.br, r.bl]
+        else:
+            ed = ed or self._props(item)
+            font = resolve_font(self._fpg, ed, self._fcache)[2]
+            r = text_rect(font, ed.text, ed.size, ed.origin)
+            q = r.morph(fitz.Point(ed.origin), fitz.Matrix(-ed.angle)) if ed.angle \
+                else r.quad
+            pts = [q.ul, q.ur, q.lr, q.ll]
+        return [self._pdf_to_cv(p.x, p.y) for p in pts]
+
+    def _draw_selection(self, item):
+        cv = self.canvas
+        quad = self._item_quad_cv(item)
+        cv.create_polygon(*[v for p in quad for v in p], outline=C["blue"], fill="",
+                          width=2, tags="ov")
+        (ux, uy), (rx, ry), (bx, by), (lx, ly) = quad
+        tx, ty = (ux + rx) / 2, (uy + ry) / 2
+        mx, my = (lx + bx) / 2, (ly + by) / 2
+        length = math.hypot(tx - mx, ty - my) or 1.0
+        hx, hy = tx + (tx - mx) / length * 24, ty + (ty - my) / length * 24
+        cv.create_line(tx, ty, hx, hy, fill=C["blue"], width=2, tags="ov")
+        cv.create_oval(hx - 8, hy - 8, hx + 8, hy + 8, fill=C["white"],
+                       outline=C["blue"], width=2, tags="ov")
+        cv.create_text(hx, hy, text="⟳", fill=C["blue"], font=("Helvetica", 9, "bold"),
+                       tags="ov")
+        self._rot_handle = (hx, hy)
+
     def _draw_overlays(self):
         cv = self.canvas
         cv.delete("ov")
+        self._rot_handle = None
         show = self.var_showboxes.get()
         for item, r in self._items:
             if self._inline and self._inline["item"] == item:
@@ -1812,7 +1836,7 @@ class PageEditor:
             x0, y0, x1, y1 = self._rect_to_cv(r)
             x0, y0, x1, y1 = x0 - 2, y0 - 2, x1 + 2, y1 + 2
             if item == self._sel:
-                cv.create_rectangle(x0, y0, x1, y1, outline=C["blue"], width=2, tags="ov")
+                self._draw_selection(item)
             elif item == self._hover:
                 cv.create_rectangle(x0, y0, x1, y1, outline=C["char_sel"], width=1,
                                     dash=(4, 2), tags="ov")
@@ -1830,6 +1854,9 @@ class PageEditor:
             self._draw_dropper(cx, cy)
             return
         if self._mode == "add":
+            return
+        if self._on_rot_handle(cx, cy):
+            self.canvas.config(cursor="exchange")
             return
         item = self._hit(*self._cv_to_pdf(cx, cy))
         if item != self._hover:
@@ -1867,6 +1894,9 @@ class PageEditor:
             self._set_mode("select")
             self._create_text_at(px, py)
             return
+        if self._on_rot_handle(cx, cy) and self._sel is not None:
+            self._start_rotation(cx, cy)
+            return
         if self._inline:
             self._close_inline(True)
         item = self._hit(px, py)
@@ -1881,6 +1911,9 @@ class PageEditor:
         if not p or p["item"] is None or self._eyedropper:
             return
         cx, cy = self._event_cv(e)
+        if p.get("rotate"):
+            self._drag_rotation(p, cx, cy, snap=bool(e.state & 0x0001))
+            return
         if not p["moved"] and abs(cx - p["cx"]) + abs(cy - p["cy"]) < 4:
             return
         p["moved"] = True
@@ -1895,6 +1928,15 @@ class PageEditor:
         p, self._press = self._press, None
         self.canvas.delete("ghost")
         if not p or self._eyedropper:
+            return
+        if p.get("rotate"):
+            if p["item"][0] == "seg":
+                self._reflow_line(p["item"][1])
+            self._render()
+            self._snap()
+            self._update_panel()
+            ed = self._get_edit(p["item"])
+            self._status(f"⟳  Rotation du texte : {ed.angle if ed else 0:g}°")
             return
         if p["item"] is None:
             if self._sel is not None:
@@ -1915,6 +1957,48 @@ class PageEditor:
             self._status("✔  Texte déplacé  ·  flèches du clavier pour ajuster finement")
         else:
             self._open_inline(p["item"], click_pdf=(p["px"], p["py"]))
+
+    # ── Rotation à la souris ────────────────────────────────────────────────
+    def _on_rot_handle(self, cx, cy):
+        h = self._rot_handle
+        return h is not None and self._inline is None and math.hypot(cx - h[0], cy - h[1]) <= 11
+
+    def _start_rotation(self, cx, cy):
+        item = self._sel
+        quad = self._item_quad_cv(item)
+        center = (sum(p[0] for p in quad) / 4, sum(p[1] for p in quad) / 4)
+        ed = self._get_edit(item, create=True)
+        self._press = {"rotate": True, "item": item, "angle0": float(ed.angle),
+                       "origin0": tuple(ed.origin), "center": center,
+                       "a0": math.atan2(cy - center[1], cx - center[0])}
+
+    def _drag_rotation(self, p, cx, cy, snap=False):
+        c0, c1 = p["center"]
+        # canvas y points down: turning the mouse counter-clockwise lowers atan2
+        delta = -math.degrees(math.atan2(cy - c1, cx - c0) - p["a0"])
+        angle = p["angle0"] + delta
+        if snap:
+            angle = round(angle / 15.0) * 15.0
+        angle = ((angle + 180.0) % 360.0) - 180.0
+        if abs(angle) < 0.01:
+            angle = 0.0
+        t = math.radians(angle - p["angle0"])
+        ox, oy = self._pdf_to_cv(*p["origin0"])
+        dx, dy = ox - c0, oy - c1
+        # rotate the baseline origin around the text centre so the text turns in place
+        nx = c0 + dx * math.cos(t) + dy * math.sin(t)
+        ny = c1 - dx * math.sin(t) + dy * math.cos(t)
+        ed = self._get_edit(p["item"], create=True)
+        ed.angle = round(angle, 2)
+        ed.origin = self._cv_to_pdf(nx, ny)
+        ed.pinned = True
+        self.canvas.delete("ghost")
+        quad = self._item_quad_cv(p["item"])
+        self.canvas.create_polygon(*[v for q in quad for v in q], outline=C["blue"],
+                                   fill="", width=2, dash=(5, 3), tags="ghost")
+        self.canvas.config(cursor="exchange")
+        self._status(f"⟳  Rotation : {ed.angle:g}°  ·  Maj : par pas de 15°")
+        self._schedule_render()
 
     # ── Édition directe sur la page ─────────────────────────────────────────
     def _tk_font(self, ed):
@@ -2052,12 +2136,6 @@ class PageEditor:
         if self._sel is not None and self._inline is None:
             self._open_inline(self._sel)
 
-    def _edit_or_commit(self):
-        if self._inline:
-            self._close_inline(True)
-        else:
-            self._edit_selected()
-
     def _create_text_at(self, px, py):
         try:
             size = float(self.var_size.get().replace(",", "."))
@@ -2110,10 +2188,11 @@ class PageEditor:
                         "helvetica", "times", "courier", "symbol", "zapfdingbats"):
                     warn = ("\n⚠ Police non installée sur ce poste : "
                             "une police proche sera utilisée pour le texte modifié.")
+                angle = f"\nRotation : {ed.angle:g}°" if ed.angle else ""
                 self.lbl_sel.config(
                     text=f"Texte détecté ({state})\nPolice d'origine : "
                          f"{font_display_name(seg['font']) or '?'}  ·  {seg['size']:g} pt"
-                         + (f"  ·  {style}" if style else "") + warn,
+                         + (f"  ·  {style}" if style else "") + angle + warn,
                     bg=C["blue_lt"], fg=C["orange"] if warn else C["navy"])
                 self.btn_revert.config(
                     state="normal" if self._edit_for_seg(item[1]) else "disabled")
@@ -2121,8 +2200,6 @@ class PageEditor:
                 self.lbl_sel.config(text="Texte ajouté\nGlissez-le pour le déplacer.",
                                     bg=C["blue_lt"], fg=C["navy"])
                 self.btn_revert.config(state="disabled")
-            self.btn_edit.config(text="✔  Valider le texte" if self._inline
-                                 else "✏  Modifier ce texte")
             self.var_font.set(self._family_label(ed))
             self.var_size.set(f"{ed.size:g}")
             self.var_bold.set(bool(ed.bold))
@@ -2132,7 +2209,6 @@ class PageEditor:
             self._bg = ed.bg
             self.var_bgmode.set("orig" if ed.bg is None else "color")
             self.swatch_bg.config(bg=_hex(ed.bg) if ed.bg is not None else C["white"])
-            self.var_angle.set(f"{ed.angle:g}")
         finally:
             self._loading = False
             self._update_stats()
@@ -2144,18 +2220,14 @@ class PageEditor:
         if field == "family":
             value = self.var_font.get()
             ed.family = ed.orig_font if value.startswith("★") and ed.orig_font else value
-        elif field in ("size", "angle"):
-            var = self.var_size if field == "size" else self.var_angle
+        elif field == "size":
             try:
-                value = float(var.get().replace(",", "."))
+                value = float(self.var_size.get().replace(",", "."))
             except ValueError:
                 return
-            if field == "size":
-                if not 2 <= value <= 400:
-                    return
-                ed.size = value
-            else:
-                ed.angle = ((value + 180.0) % 360.0) - 180.0 if abs(value) > 180 else value
+            if not 2 <= value <= 400:
+                return
+            ed.size = value
         elif field == "bold":
             ed.bold = self.var_bold.get()
         elif field == "italic":
