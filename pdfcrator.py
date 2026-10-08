@@ -1,21 +1,27 @@
 """
-PDF Merger Pro V2.2 — Safran Engineering Services
-Nouvelles fonctionnalités :
-  • Édition de texte en TEMPS RÉEL (l'overlay se met à jour pendant la frappe)
-  • Texte ajouté DÉPLAÇABLE et REDIMENSIONNABLE après création
-  • Sélection CARACTÈRE PAR CARACTÈRE par glisser-souris (comme Word)
-  • Tout le reste de la V2.1 conservé
+PDF Merger Pro V3.0 — Safran Engineering Services
+Éditeur de page façon pdfFiller :
+  • Détection automatique de TOUS les textes de la page
+  • Modification directe sur la page (clic → saisie → Entrée)
+  • Remplacement RÉEL du texte (le copier-coller donne le nouveau texte)
+  • Police, taille, gras, italique, couleur et arrière-plan d'origine conservés
+  • Déplacement, rotation du texte, pipette de couleur, ajout de texte
 
 pip install PyPDF2 PyMuPDF Pillow
 """
 
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, colorchooser
+from tkinter import font as tkfont
 from pathlib import Path
 import threading
 import copy
-import io
+import hashlib
+import math
+import re
+import struct
 import subprocess
+import sys
 import tempfile
 import os
 
@@ -59,59 +65,522 @@ CARD_H  = THUMB_H + 60
 PAD_X   = 12
 PAD_Y   = 14
 
-FONT_MAP = {
-    "helvetica":   "helv", "arial":     "helv", "arialmt":   "helv",
-    "times":       "tiro", "timesnew":  "tiro", "timesroman":"tiro",
-    "courier":     "cour", "couriernew":"cour", "consolas":  "cour",
+# ══════════════════════════════════════════════════════════════════════════════
+#  MOTEUR TEXTE  —  détection des textes, polices, remplacement réel
+# ══════════════════════════════════════════════════════════════════════════════
+LINE_H = 1.2
+
+_STYLE_SUFFIXES = ("bolditalic", "boldoblique", "semibold", "demibold", "extrabold",
+                   "bold", "italic", "oblique", "regular", "medium", "normal",
+                   "book", "mt", "ps")
+
+FAMILY_ALIASES = {
+    "helvetica":     ["arial", "liberationsans", "nimbussans", "freesans", "dejavusans"],
+    "arial":         ["helvetica", "liberationsans", "nimbussans", "freesans", "dejavusans"],
+    "times":         ["timesnewroman", "liberationserif", "nimbusroman", "freeserif", "dejavuserif"],
+    "timesnewroman": ["times", "liberationserif", "nimbusroman", "freeserif", "dejavuserif"],
+    "courier":       ["couriernew", "liberationmono", "nimbusmono", "freemono", "dejavusansmono"],
+    "couriernew":    ["courier", "liberationmono", "nimbusmono", "freemono", "dejavusansmono"],
+    "calibri":       ["carlito", "arial", "liberationsans"],
+    "cambria":       ["caladea", "timesnewroman", "liberationserif"],
 }
 
 
-def map_font(font_name: str, is_bold: bool, is_italic: bool):
-    if not font_name:
-        return "helv", False
-    fn = font_name.lower().replace("-", "").replace(" ", "")
-    base = "helv"
-    matched = False
-    for key, val in FONT_MAP.items():
-        if key in fn:
-            base = val
-            matched = True
-            break
-    if not is_bold and ("bold" in fn or "black" in fn or "heavy" in fn):
-        is_bold = True
-    if not is_italic and ("italic" in fn or "oblique" in fn):
-        is_italic = True
-    full_map = {
-        ("helv", False, False): "helv", ("helv", True,  False): "hebo",
-        ("helv", False, True ): "heit", ("helv", True,  True ): "hebi",
-        ("tiro", False, False): "tiro", ("tiro", True,  False): "tibo",
-        ("tiro", False, True ): "tiit", ("tiro", True,  True ): "tibi",
-        ("cour", False, False): "cour", ("cour", True,  False): "cobo",
-        ("cour", False, True ): "coit", ("cour", True,  True ): "cobi",
+def font_family_key(name):
+    """'ABCDEF+Arial-BoldMT' -> 'arial' ; 'Times New Roman Bold' -> 'timesnewroman'."""
+    if not name:
+        return ""
+    n = name.split("+", 1)[-1]
+    n = re.split(r"[-,]", n, maxsplit=1)[0]
+    n = re.sub(r"[^a-z0-9]", "", n.lower())
+    changed = True
+    while changed:
+        changed = False
+        for suf in _STYLE_SUFFIXES:
+            if n.endswith(suf) and len(n) > len(suf) + 1:
+                n = n[: -len(suf)]
+                changed = True
+                break
+    return n
+
+
+def font_display_name(name):
+    """Nom lisible d'une police : 'ABCDEF+TimesNewRomanPS-BoldMT' -> 'Times New Roman'."""
+    if not name:
+        return ""
+    n = name.split("+", 1)[-1]
+    n = re.split(r"[-,]", n, maxsplit=1)[0]
+    n = re.sub(r"(?i)\s+(bold|italic|oblique|regular|semibold|medium)\b.*$", "", n).strip()
+    n = re.sub(r"(PSMT|MT|PS)$", "", n)
+    if " " not in n:
+        n = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", n)
+    return n.strip() or name
+
+
+def base14_name(fam_key, bold, italic):
+    if any(t in fam_key for t in ("courier", "mono", "consol")):
+        base = "cour"
+    elif "sans" not in fam_key and any(t in fam_key for t in
+            ("times", "roman", "serif", "georgia", "garamond", "cambria", "book", "palatino")):
+        base = "tiro"
+    else:
+        base = "helv"
+    table = {
+        ("helv", False, False): "helv", ("helv", True, False): "hebo",
+        ("helv", False, True): "heit",  ("helv", True, True): "hebi",
+        ("tiro", False, False): "tiro", ("tiro", True, False): "tibo",
+        ("tiro", False, True): "tiit",  ("tiro", True, True): "tibi",
+        ("cour", False, False): "cour", ("cour", True, False): "cobo",
+        ("cour", False, True): "coit",  ("cour", True, True): "cobi",
     }
-    return full_map.get((base, is_bold, is_italic), base), matched
+    return table[(base, bool(bold), bool(italic))]
+
+
+def _sfnt_info(path):
+    """(famille, gras, italique) lus dans les tables 'name' et 'OS/2' d'un .ttf/.otf
+    (sans PyMuPDF, qui n'est pas thread-safe)."""
+    with open(path, "rb") as f:
+        header = f.read(12)
+        if len(header) < 12:
+            return None
+        num = struct.unpack(">H", header[4:6])[0]
+        if not 0 < num < 200:
+            return None
+        directory = f.read(16 * num)
+        tables = {}
+        for i in range(num):
+            tag, _, off, length = struct.unpack(">4sIII", directory[i * 16:(i + 1) * 16])
+            tables[tag] = (off, length)
+        if b"name" not in tables:
+            return None
+        off, length = tables[b"name"]
+        f.seek(off)
+        table = f.read(length)
+        _, count, str_off = struct.unpack(">HHH", table[:6])
+        names = {}
+        for i in range(count):
+            rec = table[6 + i * 12: 18 + i * 12]
+            if len(rec) < 12:
+                break
+            pid, eid, lid, nid, ln, so = struct.unpack(">HHHHHH", rec)
+            if nid not in (1, 2):
+                continue
+            raw = table[str_off + so: str_off + so + ln]
+            try:
+                if pid == 3:
+                    text, rank = raw.decode("utf-16-be"), (0 if lid == 0x409 else 1)
+                elif pid == 1 and eid == 0:
+                    text, rank = raw.decode("latin-1"), 2
+                else:
+                    continue
+            except UnicodeDecodeError:
+                continue
+            if nid not in names or rank < names[nid][0]:
+                names[nid] = (rank, text)
+        family = names.get(1, (0, ""))[1].strip()
+        sub = names.get(2, (0, ""))[1].lower()
+        bold = any(w in sub for w in ("bold", "black", "heavy"))
+        italic = "italic" in sub or "oblique" in sub
+        if b"OS/2" in tables and tables[b"OS/2"][1] >= 64:
+            f.seek(tables[b"OS/2"][0] + 62)
+            fs = struct.unpack(">H", f.read(2))[0]
+            bold = bold or bool(fs & 0x20)
+            italic = italic or bool(fs & 0x01)
+        return (family, bold, italic) if family else None
+
+
+class FontManager:
+    """Index des polices installées sur le poste (Windows / macOS / Linux)."""
+    _index = None
+    _display = {}
+    _lock = threading.Lock()
+    _fonts = {}
+
+    @staticmethod
+    def _font_dirs():
+        dirs = []
+        if sys.platform.startswith("win"):
+            dirs.append(os.path.join(os.environ.get("WINDIR", r"C:\Windows"), "Fonts"))
+            local = os.environ.get("LOCALAPPDATA")
+            if local:
+                dirs.append(os.path.join(local, "Microsoft", "Windows", "Fonts"))
+        elif sys.platform == "darwin":
+            dirs += ["/System/Library/Fonts", "/Library/Fonts",
+                     os.path.expanduser("~/Library/Fonts")]
+        else:
+            dirs += ["/usr/share/fonts", "/usr/local/share/fonts",
+                     os.path.expanduser("~/.fonts"), os.path.expanduser("~/.local/share/fonts")]
+        return [d for d in dirs if os.path.isdir(d)]
+
+    @classmethod
+    def index(cls):
+        with cls._lock:
+            if cls._index is None:
+                idx = {}
+                for d in cls._font_dirs():
+                    for root, _, files in os.walk(d):
+                        for f in files:
+                            if not f.lower().endswith((".ttf", ".otf")):
+                                continue
+                            path = os.path.join(root, f)
+                            try:
+                                info = _sfnt_info(path)
+                            except (OSError, struct.error):
+                                continue
+                            if not info:
+                                continue
+                            name, bold, italic = info
+                            fam = font_family_key(name)
+                            if not fam:
+                                continue
+                            idx.setdefault(fam, []).append((path, bold, italic))
+                            cls._display.setdefault(fam, name)
+                cls._index = idx
+            return cls._index
+
+    @classmethod
+    def display(cls, fam_key):
+        cls.index()
+        return cls._display.get(fam_key, fam_key)
+
+    @classmethod
+    def families(cls):
+        idx = cls.index()
+        names = {cls._display.get(k, k) for k in idx}
+        names.update(("Helvetica", "Times", "Courier"))
+        return sorted(names, key=str.lower)
+
+    @classmethod
+    def find_file(cls, fam_key, bold, italic):
+        idx = cls.index()
+        for key in [fam_key] + FAMILY_ALIASES.get(fam_key, []):
+            cands = idx.get(key)
+            if cands:
+                best = max(cands, key=lambda c: (c[1] == bool(bold)) * 2 + (c[2] == bool(italic)))
+                return best[0]
+        return None
+
+    @classmethod
+    def font(cls, key, path=None, buffer=None, base14=None):
+        f = cls._fonts.get(key)
+        if f is None:
+            if path:
+                f = fitz.Font(fontfile=path)
+            elif buffer:
+                f = fitz.Font(fontbuffer=buffer)
+            else:
+                f = fitz.Font(base14)
+            cls._fonts[key] = f
+        return f
+
+
+def _covers(font, text):
+    """Vrai si la police contient un vrai glyphe pour chaque caractère du texte
+    (les polices 'subset' des PDF n'ont souvent que les lettres déjà utilisées)."""
+    try:
+        for ch in set(text):
+            if ch.isspace():
+                continue
+            if not font.has_glyph(ord(ch)):
+                return False
+            if font.glyph_bbox(ord(ch)).is_empty:
+                return False
+        return True
+    except Exception:
+        return False
+
+
+def _embedded_font_buffer(page, orig_font):
+    target = (orig_font or "").split("+", 1)[-1]
+    try:
+        for f in page.get_fonts(full=True):
+            xref, ext, ftype, basefont = f[0], f[1], f[2], f[3]
+            if ext == "n/a" or ftype == "Type3":
+                continue
+            if basefont.split("+", 1)[-1] == target:
+                buf = page.parent.extract_font(xref)[3]
+                if buf:
+                    return buf
+    except Exception:
+        pass
+    return None
+
+
+def resolve_font(page, ed, cache=None):
+    """Choisit la police à utiliser pour écrire ed.text, par ordre de fidélité :
+    1. la police intégrée au PDF (si style inchangé et tous les glyphes présents)
+    2. la même famille installée sur le poste (Arial, Calibri, Times…)
+    3. la police PDF standard la plus proche.
+    Renvoie (kind, value, fitz.Font, key) avec kind in 'buffer' | 'file' | 'base14'."""
+    cache = {} if cache is None else cache
+    text = ed.text or ""
+    ck = ("res", ed.family, ed.orig_font, bool(ed.bold), bool(ed.italic), ed.orig_style, text)
+    if ck in cache:
+        return cache[ck]
+    res = None
+    fam = font_family_key(ed.family)
+    same_style = (ed.orig_font and ed.family == ed.orig_font
+                  and ed.orig_style == (bool(ed.bold), bool(ed.italic)))
+    if same_style and page is not None:
+        bk = ("emb", ed.orig_font)
+        if bk not in cache:
+            cache[bk] = _embedded_font_buffer(page, ed.orig_font)
+        buf = cache[bk]
+        if buf:
+            key = "emb:" + hashlib.md5(buf).hexdigest()
+            try:
+                font = FontManager.font(key, buffer=buf)
+                if _covers(font, text):
+                    res = ("buffer", buf, font, key)
+            except Exception:
+                pass
+    if res is None:
+        path = FontManager.find_file(fam, ed.bold, ed.italic)
+        if path:
+            try:
+                font = FontManager.font(path, path=path)
+                if _covers(font, text):
+                    res = ("file", path, font, path)
+            except Exception:
+                pass
+    if res is None:
+        b14 = base14_name(fam, ed.bold, ed.italic)
+        res = ("base14", b14, FontManager.font(b14, base14=b14), b14)
+    cache[ck] = res
+    return res
+
+
+def text_rect(font, text, size, origin, angle=0.0):
+    lines = (text or " ").split("\n")
+    width = max(font.text_length(line, fontsize=size) for line in lines)
+    asc = font.ascender or 0.9
+    desc = font.descender or -0.25
+    x, y = origin
+    r = fitz.Rect(x, y - asc * size, x + max(width, size * 0.5),
+                  y - desc * size + (len(lines) - 1) * size * LINE_H)
+    if angle:
+        # insert_text's morph works in PDF space (y up), Rect.morph in page space (y down)
+        r = r.morph(fitz.Point(origin), fitz.Matrix(-angle)).rect
+    return r
+
+
+def _span_style(span):
+    fname = span.get("font", "") or ""
+    low = fname.lower()
+    flags = span.get("flags", 0)
+    bold = bool(flags & 16) or any(w in low for w in ("bold", "black", "heavy", "semibold", "demi"))
+    italic = bool(flags & 2) or "italic" in low or "oblique" in low
+    c = span.get("color", 0)
+    rgb = (((c >> 16) & 255) / 255.0, ((c >> 8) & 255) / 255.0, (c & 255) / 255.0)
+    return fname, round(span.get("size", 11.0), 2), rgb, bold, italic
+
+
+def _erase_rects(chars, size, angle):
+    """Zones de redaction qui touchent toutes les lettres du segment (et ses
+    espaces de bord) mais aucune lettre voisine : MuPDF supprime tout caractère
+    que la zone touche, d'où le retrait de 30 % aux extrémités."""
+    vis = [c for c in chars if not c["c"].isspace()]
+    if not vis:
+        return []
+    if angle == 0.0:
+        first, last = chars[0]["bbox"], chars[-1]["bbox"]
+        oy = vis[0]["origin"][1]
+        x0 = first[0] + 0.3 * max(0.2, first[2] - first[0])
+        x1 = last[2] - 0.3 * max(0.2, last[2] - last[0])
+        if x1 <= x0:
+            x1 = x0 + 0.1
+        return [(x0, oy - size * 0.5, x1, oy - size * 0.2)]
+    out = []
+    h = max(0.2, size * 0.08)
+    for c in vis:
+        b = c["bbox"]
+        cx, cy = (b[0] + b[2]) / 2, (b[1] + b[3]) / 2
+        out.append((cx - h, cy - h, cx + h, cy + h))
+    return out
+
+
+def extract_segments(page):
+    """Détecte tous les textes de la page, découpés en segments de style homogène
+    (même police, taille, couleur, gras, italique) — comme pdfFiller."""
+    flags = fitz.TEXT_PRESERVE_WHITESPACE | fitz.TEXT_MEDIABOX_CLIP
+    raw = page.get_text("rawdict", flags=flags)
+    segs = []
+
+    def flush(cur):
+        if not cur:
+            return
+        chars = cur["chars"]
+        lead, trail = list(cur["lead"]), []
+        while chars and chars[0]["c"].isspace():
+            lead.append(chars.pop(0))
+        while chars and chars[-1]["c"].isspace():
+            trail.insert(0, chars.pop())
+        if not chars:
+            return
+        fname, size, rgb, bold, italic = cur["style"]
+        bb = fitz.Rect(chars[0]["bbox"])
+        for c in chars[1:]:
+            bb |= fitz.Rect(c["bbox"])
+        o = chars[0]["origin"]
+        segs.append({
+            "key": len(segs),
+            "text": "".join(c["c"] for c in chars),
+            "bbox": tuple(bb),
+            "origin": (o[0], o[1]),
+            "size": size, "font": fname, "bold": bold, "italic": italic,
+            "color": rgb, "angle": cur["angle"],
+            "erase": _erase_rects(lead + chars + trail, size, cur["angle"]),
+            "chars": [tuple(c["bbox"]) for c in chars],
+        })
+
+    for block in raw.get("blocks", []):
+        if block.get("type", 0) != 0:
+            continue
+        for line in block.get("lines", []):
+            dx, dy = line.get("dir", (1.0, 0.0))
+            angle = round(math.degrees(math.atan2(-dy, dx)), 2)
+            if abs(angle) < 0.05:
+                angle = 0.0
+            cur = None
+            pending = []
+            for span in line.get("spans", []):
+                style = _span_style(span)
+                size = style[1]
+                for ch in span.get("chars", []):
+                    is_space = ch["c"].isspace()
+                    wide_gap = is_space and (ch["bbox"][2] - ch["bbox"][0]) > size * 1.2
+                    if cur is not None:
+                        prev = cur["chars"][-1]
+                        gap = ch["bbox"][0] - prev["bbox"][2] if angle == 0.0 else 0
+                        if cur["style"] != style or wide_gap or gap > size * 1.2:
+                            flush(cur)
+                            cur = None
+                    if cur is None:
+                        if is_space:
+                            pending = [] if wide_gap else pending + [ch]
+                            continue
+                        cur = {"style": style, "angle": angle, "chars": [], "lead": pending}
+                        pending = []
+                    cur["chars"].append(ch)
+            flush(cur)
+    return segs
+
+
+def _apply_redactions(page):
+    images = getattr(fitz, "PDF_REDACT_IMAGE_NONE", 0)
+    try:
+        page.apply_redactions(images=images,
+                              graphics=getattr(fitz, "PDF_REDACT_LINE_ART_NONE", 0))
+    except TypeError:
+        page.apply_redactions(images=images)
+
+
+def apply_edits_to_page(page, edits, cache=None):
+    """Applique les édits : suppression RÉELLE du texte d'origine (sans toucher
+    à l'arrière-plan), puis écriture du nouveau texte au même endroit."""
+    if not edits:
+        return
+    cache = {} if cache is None else cache
+    rot = page.rotation
+    if rot:
+        page.set_rotation(0)
+    try:
+        writes = [(ed, resolve_font(page, ed, cache)) for ed in edits
+                  if ed.kind in ("replace", "add") and (ed.text or "").strip()]
+        n = 0
+        for ed in edits:
+            if ed.kind in ("replace", "delete"):
+                for r in ed.erase or []:
+                    page.add_redact_annot(fitz.Rect(r), fill=False)
+                    n += 1
+        if n:
+            _apply_redactions(page)
+        inserted = set()
+        for ed, (kind, value, font, key) in writes:
+            origin = fitz.Point(ed.origin)
+            morph = (origin, fitz.Matrix(ed.angle)) if ed.angle else None
+            if ed.bg is not None:
+                r = text_rect(font, ed.text, ed.size, ed.origin)
+                r = fitz.Rect(r.x0 - 1.5, r.y0 - 1, r.x1 + 1.5, r.y1 + 1)
+                page.draw_rect(r, color=None, fill=ed.bg, width=0, morph=morph)
+            try:
+                if kind == "base14":
+                    fontname = value
+                else:
+                    fontname = "F" + hashlib.md5(str(key).encode()).hexdigest()[:10]
+                    if fontname not in inserted:
+                        if kind == "buffer":
+                            page.insert_font(fontname=fontname, fontbuffer=value)
+                        else:
+                            page.insert_font(fontname=fontname, fontfile=value)
+                        inserted.add(fontname)
+                page.insert_text(origin, ed.text, fontname=fontname, fontsize=ed.size,
+                                 color=ed.color, lineheight=LINE_H, morph=morph)
+            except Exception:
+                page.insert_text(origin, ed.text,
+                                 fontname=base14_name(font_family_key(ed.family), ed.bold, ed.italic),
+                                 fontsize=ed.size, color=ed.color, lineheight=LINE_H, morph=morph)
+    finally:
+        if rot:
+            page.set_rotation(rot)
 
 
 class Edit:
-    """Une opération d'édition appliquée à une page.
-    Pour les édits 'add', un id unique permet de les identifier (déplaçables).
-    """
-    __slots__ = ("kind", "bbox", "text", "font", "size", "color", "bg", "uid")
+    """Une modification de texte sur une page.
+    kind : 'replace' (texte détecté modifié), 'delete' (texte détecté supprimé),
+           'add' (nouveau texte). bg=None conserve l'arrière-plan d'origine."""
+    __slots__ = ("kind", "text", "family", "orig_font", "orig_style", "bold", "italic",
+                 "size", "color", "bg", "angle", "origin", "erase", "seg_key", "orig", "uid",
+                 "pinned")
 
-    def __init__(self, kind, bbox=None, text="", font="helv",
-                 size=11, color=(0, 0, 0), bg=(1, 1, 1), uid=None):
+    def __init__(self, kind, text="", family="Helvetica", size=11.0, color=(0, 0, 0),
+                 bg=None, bold=False, italic=False, angle=0.0, origin=(0.0, 0.0),
+                 erase=None, seg_key=None, orig_font=None, orig_style=None, uid=None):
         self.kind = kind
-        self.bbox = bbox
         self.text = text
-        self.font = font
+        self.family = family
+        self.orig_font = orig_font
+        self.orig_style = orig_style
+        self.bold = bold
+        self.italic = italic
         self.size = size
-        self.color = color
-        self.bg = bg
+        self.color = tuple(color)
+        self.bg = None if bg is None else tuple(bg)
+        self.angle = angle
+        self.origin = tuple(origin)
+        self.erase = erase or []
+        self.seg_key = seg_key
+        self.orig = None
         self.uid = uid
+        self.pinned = False   # positioned by hand: never shifted by line reflow
+
+    @classmethod
+    def from_segment(cls, seg):
+        ed = cls("replace", text=seg["text"], family=seg["font"], size=seg["size"],
+                 color=seg["color"], bold=seg["bold"], italic=seg["italic"],
+                 angle=seg["angle"], origin=seg["origin"], erase=list(seg["erase"]),
+                 seg_key=seg["key"], orig_font=seg["font"],
+                 orig_style=(seg["bold"], seg["italic"]))
+        ed.orig = ed.state()
+        return ed
+
+    def state(self):
+        return (self.kind, self.text, self.family, bool(self.bold), bool(self.italic),
+                round(float(self.size), 2), tuple(round(c, 3) for c in self.color),
+                None if self.bg is None else tuple(round(c, 3) for c in self.bg),
+                round(float(self.angle), 2),
+                (round(self.origin[0], 2), round(self.origin[1], 2)))
+
+    def is_noop(self):
+        return self.kind == "replace" and self.orig is not None and self.state() == self.orig
+
+
+def _hex(rgb):
+    return "#{:02x}{:02x}{:02x}".format(*(max(0, min(255, int(round(c * 255)))) for c in rgb))
 
 
 class Page:
-    __slots__ = ("path", "fname", "pg_idx", "photo", "rotation", "edits")
+    __slots__ = ("path", "fname", "pg_idx", "photo", "rotation", "edits", "thumb")
 
     def __init__(self, path, fname, pg_idx):
         self.path     = path
@@ -120,6 +589,15 @@ class Page:
         self.photo    = None
         self.rotation = 0
         self.edits    = []
+        self.thumb    = None
+
+    def __deepcopy__(self, memo):
+        # photo is a Tk image (not copyable); thumb is never mutated, so share it
+        p = Page(self.path, self.fname, self.pg_idx)
+        p.rotation = self.rotation
+        p.edits = copy.deepcopy(self.edits, memo)
+        p.thumb = self.thumb
+        return p
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -128,7 +606,7 @@ class Page:
 class PDFMergerPro:
     def __init__(self, root):
         self.root = root
-        self.root.title("PDF Merger Pro V2.2 — Safran Engineering Services")
+        self.root.title("PDF Merger Pro V3.0 — Safran Engineering Services")
         self.root.geometry("1240x780")
         self.root.minsize(800, 520)
         self.root.configure(bg=C["navy2"])
@@ -147,12 +625,22 @@ class PDFMergerPro:
         self._build_ui()
         self._snapshot()
 
-        self.root.bind_all("<Control-z>", lambda e: self.undo())
-        self.root.bind_all("<Control-Z>", lambda e: self.undo())
-        self.root.bind_all("<Control-y>", lambda e: self.redo())
-        self.root.bind_all("<Control-Y>", lambda e: self.redo())
-        self.root.bind_all("<Control-Shift-Z>", lambda e: self.redo())
-        self.root.bind_all("<Delete>", lambda e: self.delete_selected())
+        for seq, fn in (("<Control-z>", self.undo), ("<Control-Z>", self.undo),
+                        ("<Control-y>", self.redo), ("<Control-Y>", self.redo),
+                        ("<Control-Shift-Z>", self.redo), ("<Delete>", self.delete_selected)):
+            self.root.bind_all(seq, lambda e, fn=fn: self._main_window_shortcut(e, fn))
+
+        if HAS_FITZ:
+            threading.Thread(target=FontManager.index, daemon=True).start()
+
+    def _main_window_shortcut(self, event, fn):
+        # bind_all also fires in the editor/print windows: only act on the main window
+        try:
+            if event.widget.winfo_toplevel() is not self.root:
+                return
+        except (AttributeError, tk.TclError):
+            return
+        fn()
 
     # ── UI ──
     def _build_ui(self):
@@ -391,9 +879,14 @@ class PDFMergerPro:
 
     def _get_thumb_image(self, page):
         raw = self._raw_thumbs.get(page.path, [])
-        if not (HAS_PIL and page.pg_idx < len(raw)):
+        if not HAS_PIL:
             return None
-        base_img = raw[page.pg_idx]
+        if page.thumb is not None:
+            base_img = page.thumb
+        elif page.pg_idx < len(raw):
+            base_img = raw[page.pg_idx]
+        else:
+            return None
         if page.rotation:
             img = base_img.rotate(-page.rotation, expand=True)
             img.thumbnail((THUMB_W, THUMB_H), Image.LANCZOS)
@@ -663,10 +1156,11 @@ class PDFMergerPro:
             return
         PageEditor(self, pos)
 
-    def on_editor_save(self, pos, rotation, edits):
+    def on_editor_save(self, pos, rotation, edits, thumb=None):
         page = self.pages[pos]
         page.rotation = rotation
         page.edits    = edits
+        page.thumb    = thumb
         page.photo    = None
         self._render_grid()
         self._upd_info()
@@ -712,6 +1206,7 @@ class PDFMergerPro:
                 self._apply_edits(new_pg, page.edits)
                 if page.rotation:
                     new_pg.set_rotation(page.rotation)
+            self._subset_fonts(out_doc, self.pages)
             out_doc.save(out, garbage=4, deflate=True)
             out_doc.close()
             for d in src_docs.values():
@@ -728,149 +1223,78 @@ class PDFMergerPro:
             self._st("⚠  Erreur lors de la fusion", warn=True)
             messagebox.showerror("Erreur de fusion", str(e))
 
-    def _sample_page_bg(self, fitz_page, bbox):
-        """Sample the background color by probing multiple points around the bbox.
-        We sample at the four outer corners and just outside each edge to avoid
-        sampling on top of the text itself, then return the median color."""
+    def _apply_edits(self, fitz_page, edits):
+        apply_edits_to_page(fitz_page, edits)
+
+    @staticmethod
+    def _subset_fonts(doc, pages):
+        # Fonts embedded for edited text are full files: keep only the used glyphs
+        if not any(p.edits for p in pages):
+            return
         try:
-            x0, y0, x1, y1 = bbox
-            pr = fitz_page.rect
-            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-            # Probe points: outside the four edges + four outer corners
-            probes = [
-                (x0 - 3, my),       # left of bbox
-                (x1 + 3, my),       # right of bbox
-                (mx,     y0 - 3),   # above bbox
-                (mx,     y1 + 3),   # below bbox
-                (x0 - 3, y0 - 3),   # top-left corner
-                (x1 + 3, y0 - 3),   # top-right corner
-                (x0 - 3, y1 + 3),   # bottom-left corner
-                (x1 + 3, y1 + 3),   # bottom-right corner
-            ]
-            samples = []
-            for px, py in probes:
-                px = max(pr.x0 + 1, min(pr.x1 - 1, px))
-                py = max(pr.y0 + 1, min(pr.y1 - 1, py))
-                pix = fitz_page.get_pixmap(
-                    matrix=fitz.Matrix(1, 1),
-                    clip=fitz.Rect(px - 1, py - 1, px + 1, py + 1))
-                if pix.samples and len(pix.samples) >= 3:
-                    samples.append((pix.samples[0], pix.samples[1], pix.samples[2]))
-            if samples:
-                # Median per channel (robust against outliers like text pixels)
-                samples.sort(key=lambda s: s[0] + s[1] + s[2])
-                mid = samples[len(samples) // 2]
-                return (mid[0] / 255.0, mid[1] / 255.0, mid[2] / 255.0)
+            doc.subset_fonts()
         except Exception:
             pass
-        return (1.0, 1.0, 1.0)
-
-    def _apply_edits(self, fitz_page, edits):
-        # Pass 1: mark all delete/replace zones as redactions so original text
-        # is physically removed from the PDF (copy-paste gives new text only).
-        page_rect = fitz_page.rect
-        redact_bboxes = set()
-        for ed in edits:
-            if ed.kind in ("delete", "replace") and ed.bbox:
-                rect = fitz.Rect(*ed.bbox)
-                extended = fitz.Rect(
-                    max(page_rect.x0, rect.x0 - 2),
-                    max(page_rect.y0, rect.y0 - 2),
-                    min(page_rect.x1, rect.x1 + 2),
-                    min(page_rect.y1, rect.y1 + 2),
-                )
-                fill = ed.bg if ed.bg is not None else self._sample_page_bg(fitz_page, ed.bbox)
-                # fill=(r,g,b) paints the redacted area with the background color
-                fitz_page.add_redact_annot(extended, fill=fill)
-                redact_bboxes.add(id(ed))
-        if redact_bboxes:
-            # apply_redactions removes text/images under the redact annotations
-            fitz_page.apply_redactions(images=fitz.PDF_REDACT_IMAGE_NONE)
-
-        # Pass 2: insert new text for replace and add edits
-        for ed in edits:
-            if ed.kind in ("add", "replace"):
-                if ed.bbox and ed.text:
-                    rect = fitz.Rect(*ed.bbox)
-                    min_h = ed.size * 1.5
-                    if rect.height < min_h:
-                        rect = fitz.Rect(rect.x0, rect.y0, rect.x1, rect.y0 + min_h)
-                    try:
-                        rc = fitz_page.insert_textbox(
-                            rect, ed.text, fontname=ed.font, fontsize=ed.size,
-                            color=ed.color, align=0)
-                        if rc < 0:
-                            raise ValueError("text overflow")
-                    except Exception:
-                        fitz_page.insert_text(
-                            (rect.x0, rect.y0 + ed.size), ed.text,
-                            fontname=ed.font, fontsize=ed.size, color=ed.color)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-#  PAGE EDITOR  —  V2.2
+#  PAGE EDITOR  —  V3 (édition directe façon pdfFiller)
 # ══════════════════════════════════════════════════════════════════════════════
 class PageEditor:
-    """Éditeur avancé : sélection caractère par caractère, édition temps réel,
-    déplacement/redimensionnement des textes ajoutés."""
+    """Tous les textes de la page sont détectés et modifiables directement sur
+    la page, en conservant police, taille, gras, couleur et arrière-plan."""
 
-    RENDER_DPI = 1.8
-    HANDLE_SIZE = 8  # taille des poignées en pixels
+    ZOOMS = (0.6, 0.8, 1.0, 1.25, 1.5, 1.75, 2.0, 2.5, 3.0)
+    MARGIN = 16
+    PALETTE = ("#000000", "#434343", "#666666", "#999999", "#CCCCCC", "#FFFFFF",
+               "#FF0000", "#FF8C00", "#FFD700", "#008000", "#00CED1", "#1E90FF",
+               "#0000CD", "#00356B", "#8A2BE2", "#FF69B4", "#8B4513", "#E8540A")
+    INPUT_WIDGETS = (tk.Entry, tk.Spinbox, tk.Text, ttk.Entry)
 
     def __init__(self, app, pos):
-        self.app  = app
-        self.pos  = pos
+        self.app = app
+        self.pos = pos
         self.page = app.pages[pos]
         self.rotation = self.page.rotation
-        self.edits    = copy.deepcopy(self.page.edits)
+        self.edits = copy.deepcopy(self.page.edits)
         self._next_uid = max([(e.uid or 0) for e in self.edits], default=0) + 1
 
-        self._hist     = []
-        self._hist_idx = -1
-        self._max_hist = 30
+        self._hist, self._hist_idx, self._max_hist = [], -1, 60
+        self._zoom_idx = 4
+        self._sel = None            # ("seg", key) | ("add", uid)
+        self._hover = None
+        self._mode = "select"       # "select" | "add"
+        self._eyedropper = None     # "text" | "bg"
+        self._press = None
+        self._inline = None
+        self._render_after = None
+        self._loading = False
+        self._fcache = {}
+        self._items = []
+        self._color = (0.0, 0.0, 0.0)
+        self._bg = None
+        self._tk_fams = None
+        self._families = None
 
-        # Caractères individuels (pour sélection Word-like)
-        self._chars = []  # list of dict {bbox, text, font, size, color, flags, line_idx}
-        self._lines = []  # group chars by visual line: list of (y_center, [char_idx, ...])
+        self._doc = fitz.open(self.page.path)
+        self._fpg = self._doc[self.page.pg_idx]
+        self._src_rot = self._fpg.rotation
+        if self._src_rot:
+            self._fpg.set_rotation(0)
+        self._segments = extract_segments(self._fpg)
+        self._seg_by_key = {s["key"]: s for s in self._segments}
 
-        # Sélection caractères : (start_idx, end_idx) inclusif, ordonné
-        self._char_sel = None
-
-        # Drag de sélection
-        self._sel_dragging = False
-        self._sel_anchor = None  # index du char où on a commencé le drag
-
-        # Édit (add) sélectionné pour déplacement
-        self._added_sel_uid = None
-        self._added_drag_mode = None  # "move" | "resize-XY" (XY: nw, ne, sw, se, n, s, e, w)
-        self._added_drag_start = None  # (mouse_pdf_x, mouse_pdf_y, original_bbox)
-
-        # Mode courant
-        self._mode = "select"  # "select" | "add"
-        self._draw_start = None
-        self._eyedropper_which = None  # "text" | "bg" | None
-
-        # Édition temps réel : on garde le bbox du span en cours d'édition
-        self._editing_bbox = None  # tuple (x0,y0,x1,y1) du dernier span/sélection éditée
-
-        # Throttle pour temps réel
-        self._realtime_after = None
-
-        self._open_doc()
         self._build_window()
-        self._render_page()
+        self._render()
         self._snap()
+        self._update_panel()
 
-    def _open_doc(self):
-        self._doc  = fitz.open(self.page.path)
-        self._fpg  = self._doc[self.page.pg_idx]
-
-    # ── UI ──
+    # ── UI ──────────────────────────────────────────────────────────────────
     def _build_window(self):
         self.win = tk.Toplevel(self.app.root)
         self.win.title(f"Éditeur — {self.page.fname}  ·  page {self.page.pg_idx + 1}")
-        self.win.geometry("1320x820")
-        self.win.minsize(900, 600)
+        self.win.geometry("1360x860")
+        self.win.minsize(960, 640)
         self.win.configure(bg=C["bg"])
         self.win.transient(self.app.root)
         self.win.protocol("WM_DELETE_WINDOW", self._on_cancel)
@@ -892,43 +1316,55 @@ class PageEditor:
                   relief="flat", cursor="hand2", padx=10, pady=4
                   ).pack(side=tk.RIGHT, padx=4, pady=8)
 
-        # Toolbar
         tb = tk.Frame(self.win, bg=C["bg2"], height=40)
         tb.pack(fill=tk.X)
         tb.pack_propagate(False)
 
-        def tbtn(parent, text, cmd, bold=False, accent=False, color=None):
-            return tk.Button(parent, text=text, command=cmd,
-                             font=("Helvetica", 8, "bold" if bold else "normal"),
-                             bg=color or (C["blue"] if accent else C["white"]),
-                             fg=C["white"] if (accent or color) else C["text"],
+        def tbtn(text, cmd, color=None):
+            return tk.Button(tb, text=text, command=cmd, font=("Helvetica", 8),
+                             bg=color or C["white"],
+                             fg=C["white"] if color else C["text"],
                              relief="flat", bd=0, activebackground=C["blue_lt"],
                              cursor="hand2", padx=10, pady=4, highlightthickness=1,
                              highlightbackground=C["line"])
 
-        self.btn_select = tbtn(tb, "🖱  Sélection", lambda: self._set_mode("select"), bold=True)
-        self.btn_select.pack(side=tk.LEFT, padx=3, pady=6)
-        self.btn_add = tbtn(tb, "➕  Ajouter texte", lambda: self._set_mode("add"))
-        self.btn_add.pack(side=tk.LEFT, padx=3, pady=6)
-        tk.Frame(tb, bg=C["line"], width=1).pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=4)
-        tbtn(tb, "⟲ 90°", lambda: self._rotate(-90)).pack(side=tk.LEFT, padx=3, pady=6)
-        tbtn(tb, "⟳ 90°", lambda: self._rotate(90)).pack(side=tk.LEFT, padx=3, pady=6)
-        tbtn(tb, "⟳ 180°", lambda: self._rotate(180)).pack(side=tk.LEFT, padx=3, pady=6)
-        tk.Frame(tb, bg=C["line"], width=1).pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=4)
-        self.btn_eundo = tbtn(tb, "↶  Annuler", self._undo)
-        self.btn_eundo.pack(side=tk.LEFT, padx=3, pady=6)
-        self.btn_eredo = tbtn(tb, "↷  Rétablir", self._redo)
-        self.btn_eredo.pack(side=tk.LEFT, padx=3, pady=6)
-        tk.Frame(tb, bg=C["line"], width=1).pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=4)
-        tbtn(tb, "🗑  Supprimer sél.", self._delete_selected, color=C["warn"]
-             ).pack(side=tk.LEFT, padx=3, pady=6)
+        def sep():
+            tk.Frame(tb, bg=C["line"], width=1).pack(side=tk.LEFT, fill=tk.Y, pady=8, padx=4)
 
-        self.lbl_mode = tk.Label(tb, text="Mode : Sélection",
-                                 font=("Helvetica", 8, "bold"),
+        self.btn_select = tbtn("✏  Modifier le texte", lambda: self._set_mode("select"))
+        self.btn_select.pack(side=tk.LEFT, padx=3, pady=6)
+        self.btn_add = tbtn("➕  Ajouter du texte", lambda: self._set_mode("add"))
+        self.btn_add.pack(side=tk.LEFT, padx=3, pady=6)
+        sep()
+        tbtn("⟲ 90°", lambda: self._rotate(-90)).pack(side=tk.LEFT, padx=3, pady=6)
+        tbtn("⟳ 90°", lambda: self._rotate(90)).pack(side=tk.LEFT, padx=3, pady=6)
+        tbtn("⟳ 180°", lambda: self._rotate(180)).pack(side=tk.LEFT, padx=3, pady=6)
+        sep()
+        self.btn_eundo = tbtn("↶  Annuler", self._undo)
+        self.btn_eundo.pack(side=tk.LEFT, padx=3, pady=6)
+        self.btn_eredo = tbtn("↷  Rétablir", self._redo)
+        self.btn_eredo.pack(side=tk.LEFT, padx=3, pady=6)
+        sep()
+        tbtn("🗑  Supprimer", self._delete_selected, color=C["warn"]
+             ).pack(side=tk.LEFT, padx=3, pady=6)
+        sep()
+        tbtn("－", lambda: self._set_zoom(-1)).pack(side=tk.LEFT, padx=(3, 0), pady=6)
+        self.lbl_zoom = tk.Label(tb, text="", width=6, font=("Helvetica", 8, "bold"),
+                                 bg=C["bg2"], fg=C["text"])
+        self.lbl_zoom.pack(side=tk.LEFT)
+        tbtn("＋", lambda: self._set_zoom(1)).pack(side=tk.LEFT, padx=(0, 3), pady=6)
+
+        self.lbl_mode = tk.Label(tb, text="", font=("Helvetica", 8, "bold"),
                                  bg=C["bg2"], fg=C["blue"])
         self.lbl_mode.pack(side=tk.RIGHT, padx=14)
 
-        # Body
+        ft = tk.Frame(self.win, bg=C["navy2"], height=24)
+        ft.pack(fill=tk.X, side=tk.BOTTOM)
+        ft.pack_propagate(False)
+        self._st_var = tk.StringVar()
+        tk.Label(ft, textvariable=self._st_var, font=("Helvetica", 8),
+                 fg="#A8CCE8", bg=C["navy2"], padx=14).pack(side=tk.LEFT, pady=3)
+
         body = tk.Frame(self.win, bg=C["bg"])
         body.pack(fill=tk.BOTH, expand=True)
         self._build_side_panel(body)
@@ -939,1038 +1375,997 @@ class PageEditor:
         vsb.pack(side=tk.RIGHT, fill=tk.Y)
         hsb = tk.Scrollbar(cwrap, orient=tk.HORIZONTAL)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
-        self.canvas = tk.Canvas(cwrap, bg="#888", yscrollcommand=vsb.set,
-                                xscrollcommand=hsb.set, highlightthickness=0)
+        self.canvas = tk.Canvas(cwrap, bg="#8A8F98", yscrollcommand=vsb.set,
+                                xscrollcommand=hsb.set, highlightthickness=0,
+                                takefocus=1)
         self.canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
         vsb.config(command=self.canvas.yview)
         hsb.config(command=self.canvas.xview)
 
-        self.canvas.bind("<Motion>",          self._on_motion)
-        self.canvas.bind("<ButtonPress-1>",   self._on_press)
-        self.canvas.bind("<B1-Motion>",       self._on_drag)
-        self.canvas.bind("<ButtonRelease-1>", self._on_release)
+        cv = self.canvas
+        cv.bind("<Motion>", self._on_motion)
+        cv.bind("<Leave>", self._on_leave)
+        cv.bind("<ButtonPress-1>", self._on_press)
+        cv.bind("<B1-Motion>", self._on_drag)
+        cv.bind("<ButtonRelease-1>", self._on_release)
+        cv.bind("<ButtonPress-3>", lambda e: self._on_escape())
+        cv.bind("<MouseWheel>", self._on_wheel)
+        cv.bind("<Shift-MouseWheel>", lambda e: self._on_wheel(e, horizontal=True))
+        cv.bind("<Control-MouseWheel>", lambda e: self._set_zoom(1 if e.delta > 0 else -1))
+        cv.bind("<Button-4>", lambda e: cv.yview_scroll(-3, "units"))
+        cv.bind("<Button-5>", lambda e: cv.yview_scroll(3, "units"))
+        cv.bind("<Control-Button-4>", lambda e: self._set_zoom(1))
+        cv.bind("<Control-Button-5>", lambda e: self._set_zoom(-1))
 
-        # Footer
-        ft = tk.Frame(self.win, bg=C["navy2"], height=24)
-        ft.pack(fill=tk.X, side=tk.BOTTOM)
-        ft.pack_propagate(False)
-        self._st_var = tk.StringVar(
-            value="Glissez pour sélectionner du texte (lettre par lettre)  ·  Ctrl+Z / Ctrl+Y")
-        tk.Label(ft, textvariable=self._st_var, font=("Helvetica", 8),
-                 fg="#A8CCE8", bg=C["navy2"], padx=14).pack(side=tk.LEFT, pady=3)
+        self._bind_key("<Control-z>", self._undo)
+        self._bind_key("<Control-Z>", self._undo)
+        self._bind_key("<Control-y>", self._redo)
+        self._bind_key("<Control-Y>", self._redo)
+        self._bind_key("<Control-s>", self._on_save, in_inputs=True)
+        self._bind_key("<Escape>", self._on_escape, in_inputs=True)
+        self._bind_key("<Delete>", self._delete_selected)
+        self._bind_key("<BackSpace>", self._delete_selected)
+        self._bind_key("<Return>", self._edit_selected)
+        for key, dx, dy in (("Left", -1, 0), ("Right", 1, 0), ("Up", 0, -1), ("Down", 0, 1)):
+            self._bind_key(f"<{key}>", lambda dx=dx, dy=dy: self._nudge(dx, dy))
+            self._bind_key(f"<Shift-{key}>", lambda dx=dx, dy=dy: self._nudge(dx * 10, dy * 10))
+        self._set_mode("select")
 
-        self.win.bind("<Control-z>", lambda e: self._undo())
-        self.win.bind("<Control-Z>", lambda e: self._undo())
-        self.win.bind("<Control-y>", lambda e: self._redo())
-        self.win.bind("<Control-Y>", lambda e: self._redo())
-        self.win.bind("<Escape>",    lambda e: self._set_mode("select"))
-        self.win.bind("<Delete>",    lambda e: self._delete_selected())
+    def _bind_key(self, seq, fn, in_inputs=False):
+        # "break" also stops the main window's bind_all shortcuts from firing here
+        def handler(e):
+            if in_inputs or not isinstance(e.widget, self.INPUT_WIDGETS):
+                fn()
+            return "break"
+        self.win.bind(seq, handler)
 
     def _build_side_panel(self, parent):
-        side = tk.Frame(parent, bg=C["white"], width=320,
+        side = tk.Frame(parent, bg=C["white"], width=330,
                         highlightthickness=1, highlightbackground=C["line"])
         side.pack(side=tk.RIGHT, fill=tk.Y)
         side.pack_propagate(False)
         tk.Label(side, text="PROPRIÉTÉS DU TEXTE", font=("Helvetica", 9, "bold"),
-                 bg=C["navy"], fg=C["white"], pady=8).pack(fill=tk.X)
+                 bg=C["navy"], fg=C["white"], pady=7).pack(fill=tk.X)
         inner = tk.Frame(side, bg=C["white"])
-        inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=12)
+        inner.pack(fill=tk.BOTH, expand=True, padx=14, pady=8)
 
-        self.lbl_sel = tk.Label(inner,
-            text="Aucun texte sélectionné\n\nGlissez la souris\nsur du texte\npour sélectionner\nlettre par lettre",
-            font=("Helvetica", 9), bg=C["bg2"], fg=C["mid"],
-            justify=tk.CENTER, pady=20)
-        self.lbl_sel.pack(fill=tk.X, pady=(0, 12))
+        def label(text, pady=(6, 1)):
+            tk.Label(inner, text=text, font=("Helvetica", 8, "bold"),
+                     bg=C["white"], fg=C["text"], anchor="w").pack(fill=tk.X, pady=pady)
 
-        tk.Label(inner, text="Texte :", font=("Helvetica", 8, "bold"),
-                 bg=C["white"], fg=C["text"], anchor="w").pack(fill=tk.X)
-        self.txt_widget = tk.Text(inner, height=5, font=("Helvetica", 9),
-                                  bg=C["bg"], fg=C["text"],
-                                  highlightthickness=1, highlightbackground=C["line"],
-                                  wrap=tk.WORD)
-        self.txt_widget.pack(fill=tk.X, pady=(2, 4))
+        def small_btn(parent, text, cmd):
+            return tk.Button(parent, text=text, command=cmd, font=("Helvetica", 8),
+                             bg=C["white"], relief="flat", highlightthickness=1,
+                             highlightbackground=C["line"], cursor="hand2", padx=6)
 
-        # ⚡ TEMPS RÉEL : binding sur la frappe
-        self.txt_widget.bind("<KeyRelease>", self._on_text_change)
+        self.lbl_sel = tk.Label(inner, text="", font=("Helvetica", 8), bg=C["bg2"],
+                                fg=C["mid"], justify=tk.LEFT, anchor="w",
+                                wraplength=290, padx=8, pady=8)
+        self.lbl_sel.pack(fill=tk.X, pady=(0, 4))
 
-        tk.Label(inner, text="⚡  Aperçu en temps réel pendant la frappe",
-                 font=("Helvetica", 7, "italic"),
-                 bg=C["white"], fg=C["ok"], anchor="w").pack(fill=tk.X, pady=(0, 8))
-
-        tk.Label(inner, text="Police :", font=("Helvetica", 8, "bold"),
-                 bg=C["white"], fg=C["text"], anchor="w").pack(fill=tk.X)
-        self.var_font = tk.StringVar(value="Helvetica")
-        self.cb_font = ttk.Combobox(inner, textvariable=self.var_font,
-                                    values=["Helvetica", "Helvetica Bold",
-                                            "Helvetica Italic", "Helvetica Bold Italic",
-                                            "Times", "Times Bold", "Times Italic",
-                                            "Times Bold Italic",
-                                            "Courier", "Courier Bold", "Courier Italic"],
-                                    state="readonly", font=("Helvetica", 9))
-        self.cb_font.pack(fill=tk.X, pady=(2, 4))
-        self.cb_font.bind("<<ComboboxSelected>>", self._on_text_change)
-
-        self.lbl_font_orig = tk.Label(inner, text="", font=("Helvetica", 7, "italic"),
-                                      bg=C["white"], fg=C["mid"], anchor="w")
-        self.lbl_font_orig.pack(fill=tk.X, pady=(0, 8))
+        label("Police :")
+        self.var_font = tk.StringVar()
+        self.cb_font = ttk.Combobox(inner, textvariable=self.var_font, state="readonly",
+                                    height=24, font=("Helvetica", 9))
+        self.cb_font.pack(fill=tk.X)
+        self.cb_font.bind("<<ComboboxSelected>>", lambda e: self._on_prop("family"))
 
         rowf = tk.Frame(inner, bg=C["white"])
-        rowf.pack(fill=tk.X, pady=(0, 10))
+        rowf.pack(fill=tk.X, pady=(8, 0))
         tk.Label(rowf, text="Taille :", font=("Helvetica", 8, "bold"),
                  bg=C["white"], fg=C["text"]).pack(side=tk.LEFT)
-        self.var_size = tk.DoubleVar(value=11)
-        sp = tk.Spinbox(rowf, from_=4, to=72, increment=0.5,
-                        textvariable=self.var_size, width=8,
-                        font=("Helvetica", 9), command=self._on_text_change)
-        sp.pack(side=tk.LEFT, padx=8)
-        sp.bind("<KeyRelease>", self._on_text_change)
+        self.var_size = tk.StringVar(value="11")
+        self.sp_size = tk.Spinbox(rowf, from_=4, to=200, increment=0.5, width=6,
+                                  textvariable=self.var_size, font=("Helvetica", 9),
+                                  command=lambda: self._on_prop("size"))
+        self.sp_size.pack(side=tk.LEFT, padx=6)
+        self.sp_size.bind("<KeyRelease>", lambda e: self._on_prop("size"))
+        self.var_bold = tk.BooleanVar(value=False)
+        self.var_italic = tk.BooleanVar(value=False)
+        self.chk_bold = tk.Checkbutton(rowf, text="G", variable=self.var_bold,
+                                       indicatoron=False, width=3,
+                                       font=("Helvetica", 9, "bold"),
+                                       selectcolor=C["blue_lt"], cursor="hand2",
+                                       command=lambda: self._on_prop("bold"))
+        self.chk_bold.pack(side=tk.LEFT, padx=(8, 2))
+        self.chk_italic = tk.Checkbutton(rowf, text="I", variable=self.var_italic,
+                                         indicatoron=False, width=3,
+                                         font=("Times", 10, "italic"),
+                                         selectcolor=C["blue_lt"], cursor="hand2",
+                                         command=lambda: self._on_prop("italic"))
+        self.chk_italic.pack(side=tk.LEFT, padx=2)
 
-        # Palette de couleurs rapide (swatches cliquables)
-        PALETTE = [
-            "#000000", "#434343", "#666666", "#999999", "#CCCCCC", "#FFFFFF",
-            "#FF0000", "#FF4500", "#FF8C00", "#FFD700", "#ADFF2F", "#008000",
-            "#00CED1", "#1E90FF", "#0000CD", "#8A2BE2", "#FF69B4", "#8B4513",
-        ]
-
+        label("Couleur du texte :", pady=(10, 1))
         rowc = tk.Frame(inner, bg=C["white"])
-        rowc.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(rowc, text="Couleur texte :", font=("Helvetica", 8, "bold"),
-                 bg=C["white"], fg=C["text"]).pack(side=tk.LEFT)
-        self.color_text = (0, 0, 0)
-        self.swatch_text = tk.Frame(rowc, width=24, height=20, bg="#000000",
-                                    highlightthickness=1, highlightbackground=C["line"])
-        self.swatch_text.pack(side=tk.LEFT, padx=6)
-        tk.Button(rowc, text="…", command=lambda: self._pick_color("text"),
-                  font=("Helvetica", 8), bg=C["white"], relief="flat",
-                  highlightthickness=1, highlightbackground=C["line"],
-                  cursor="hand2", padx=6).pack(side=tk.LEFT)
-        tk.Button(rowc, text="🔍", command=lambda: self._start_eyedropper("text"),
-                  font=("Helvetica", 9), bg=C["white"], relief="flat",
-                  highlightthickness=1, highlightbackground=C["line"],
-                  cursor="hand2", padx=4).pack(side=tk.LEFT, padx=(3, 0))
+        rowc.pack(fill=tk.X)
+        self.swatch_text = tk.Frame(rowc, width=26, height=20, bg="#000000",
+                                    highlightthickness=1, highlightbackground=C["mid"])
+        self.swatch_text.pack(side=tk.LEFT)
+        self.btn_text_more = small_btn(rowc, "Autre…", lambda: self._pick_color("text"))
+        self.btn_text_more.pack(side=tk.LEFT, padx=6)
+        self.btn_text_drop = small_btn(rowc, "💧 Pipette", lambda: self._start_eyedropper("text"))
+        self.btn_text_drop.pack(side=tk.LEFT)
+        self._palette(inner, lambda rgb: self._set_text_color(rgb))
 
-        # Palette rapide couleur texte
-        pal_text = tk.Frame(inner, bg=C["white"])
-        pal_text.pack(fill=tk.X, pady=(0, 10))
-        for i, hex_col in enumerate(PALETTE):
-            r = int(hex_col[1:3], 16) / 255
-            g = int(hex_col[3:5], 16) / 255
-            b = int(hex_col[5:7], 16) / 255
-            btn = tk.Frame(pal_text, width=16, height=16, bg=hex_col,
-                           highlightthickness=1, highlightbackground="#888",
-                           cursor="hand2")
-            btn.grid(row=i // 9, column=i % 9, padx=1, pady=1)
-            btn.bind("<Button-1>",
-                lambda e, n=(r, g, b), h=hex_col: self._apply_color("text", n, h))
-
+        label("Arrière-plan :", pady=(10, 1))
+        self.var_bgmode = tk.StringVar(value="orig")
+        self.rb_bg_orig = tk.Radiobutton(inner, text="Conserver l'arrière-plan d'origine",
+                                         variable=self.var_bgmode, value="orig",
+                                         font=("Helvetica", 8), bg=C["white"],
+                                         anchor="w", command=self._on_bgmode)
+        self.rb_bg_orig.pack(fill=tk.X)
         rowb = tk.Frame(inner, bg=C["white"])
-        rowb.pack(fill=tk.X, pady=(0, 4))
-        tk.Label(rowb, text="Couleur de fond :", font=("Helvetica", 8, "bold"),
+        rowb.pack(fill=tk.X)
+        self.rb_bg_color = tk.Radiobutton(rowb, text="Couleur de fond :",
+                                          variable=self.var_bgmode, value="color",
+                                          font=("Helvetica", 8), bg=C["white"],
+                                          command=self._on_bgmode)
+        self.rb_bg_color.pack(side=tk.LEFT)
+        self.swatch_bg = tk.Frame(rowb, width=26, height=20, bg=C["white"],
+                                  highlightthickness=1, highlightbackground=C["mid"])
+        self.swatch_bg.pack(side=tk.LEFT, padx=4)
+        self.btn_bg_more = small_btn(rowb, "Autre…", lambda: self._pick_color("bg"))
+        self.btn_bg_more.pack(side=tk.LEFT, padx=2)
+        self.btn_bg_drop = small_btn(rowb, "💧", lambda: self._start_eyedropper("bg"))
+        self.btn_bg_drop.pack(side=tk.LEFT, padx=2)
+        self._palette(inner, lambda rgb: self._set_bg_color(rgb))
+        tk.Label(inner, text="« Couleur de fond » active la pipette : cliquez sur la page.",
+                 font=("Helvetica", 7, "italic"), bg=C["white"], fg=C["mid"],
+                 anchor="w").pack(fill=tk.X)
+
+        rowa = tk.Frame(inner, bg=C["white"])
+        rowa.pack(fill=tk.X, pady=(10, 0))
+        tk.Label(rowa, text="Rotation du texte (°) :", font=("Helvetica", 8, "bold"),
                  bg=C["white"], fg=C["text"]).pack(side=tk.LEFT)
-        self.color_bg = (1, 1, 1)
-        self.swatch_bg = tk.Frame(rowb, width=24, height=20, bg="#FFFFFF",
-                                  highlightthickness=1, highlightbackground=C["line"])
-        self.swatch_bg.pack(side=tk.LEFT, padx=6)
-        tk.Button(rowb, text="…", command=lambda: self._pick_color("bg"),
-                  font=("Helvetica", 8), bg=C["white"], relief="flat",
-                  highlightthickness=1, highlightbackground=C["line"],
-                  cursor="hand2", padx=6).pack(side=tk.LEFT)
-        tk.Button(rowb, text="🔍", command=lambda: self._start_eyedropper("bg"),
-                  font=("Helvetica", 9), bg=C["white"], relief="flat",
-                  highlightthickness=1, highlightbackground=C["line"],
-                  cursor="hand2", padx=4).pack(side=tk.LEFT, padx=(3, 0))
+        self.var_angle = tk.StringVar(value="0")
+        self.sp_angle = tk.Spinbox(rowa, from_=-360, to=360, increment=15, width=6,
+                                   textvariable=self.var_angle, font=("Helvetica", 9),
+                                   command=lambda: self._on_prop("angle"))
+        self.sp_angle.pack(side=tk.LEFT, padx=6)
+        self.sp_angle.bind("<KeyRelease>", lambda e: self._on_prop("angle"))
 
-        # Option : aucun arrière-plan (transparent)
-        nobg_row = tk.Frame(inner, bg=C["white"])
-        nobg_row.pack(fill=tk.X, pady=(2, 0))
-        self._no_bg_var = tk.BooleanVar(value=False)
-        tk.Checkbutton(nobg_row, text="Aucun arrière-plan (transparent)",
-                       variable=self._no_bg_var,
-                       font=("Helvetica", 8), bg=C["white"], fg=C["text"],
-                       cursor="hand2",
-                       command=self._on_no_bg_change).pack(side=tk.LEFT)
+        tk.Frame(inner, bg=C["line"], height=1).pack(fill=tk.X, pady=10)
+        self.btn_edit = tk.Button(inner, text="✏  Modifier ce texte", command=self._edit_or_commit,
+                                  font=("Helvetica", 9, "bold"), bg=C["ok"], fg=C["white"],
+                                  relief="flat", activebackground="#0F6238",
+                                  cursor="hand2", pady=6)
+        self.btn_edit.pack(fill=tk.X, pady=(0, 5))
+        self.btn_revert = tk.Button(inner, text="↺  Rétablir le texte d'origine",
+                                    command=self._revert_selected, font=("Helvetica", 8),
+                                    bg=C["white"], fg=C["text"], relief="flat",
+                                    highlightthickness=1, highlightbackground=C["line"],
+                                    cursor="hand2", pady=4)
+        self.btn_revert.pack(fill=tk.X, pady=(0, 5))
+        self.btn_delete = tk.Button(inner, text="🗑  Supprimer ce texte",
+                                    command=self._delete_selected, font=("Helvetica", 8),
+                                    bg=C["white"], fg=C["warn"], relief="flat",
+                                    highlightthickness=1, highlightbackground=C["line"],
+                                    cursor="hand2", pady=4)
+        self.btn_delete.pack(fill=tk.X)
 
-        # Palette rapide couleur fond
-        pal_bg = tk.Frame(inner, bg=C["white"])
-        pal_bg.pack(fill=tk.X, pady=(4, 6))
-        for i, hex_col in enumerate(PALETTE):
-            r = int(hex_col[1:3], 16) / 255
-            g = int(hex_col[3:5], 16) / 255
-            b = int(hex_col[5:7], 16) / 255
-            btn = tk.Frame(pal_bg, width=16, height=16, bg=hex_col,
-                           highlightthickness=1, highlightbackground="#888",
-                           cursor="hand2")
-            btn.grid(row=i // 9, column=i % 9, padx=1, pady=1)
-            btn.bind("<Button-1>",
-                lambda e, n=(r, g, b), h=hex_col: self._apply_color("bg", n, h))
+        tk.Frame(inner, bg=C["line"], height=1).pack(fill=tk.X, pady=10)
+        self.var_showboxes = tk.BooleanVar(value=True)
+        tk.Checkbutton(inner, text="Afficher les zones de texte détectées",
+                       variable=self.var_showboxes, font=("Helvetica", 8),
+                       bg=C["white"], anchor="w",
+                       command=self._draw_overlays).pack(fill=tk.X)
+        self.lbl_stats = tk.Label(inner, text="", font=("Helvetica", 8), bg=C["white"],
+                                  fg=C["mid"], justify=tk.LEFT, anchor="w")
+        self.lbl_stats.pack(fill=tk.X, pady=(4, 0))
 
-        tk.Label(inner, text="(efface le texte d'origine)",
-                 font=("Helvetica", 7, "italic"),
-                 bg=C["white"], fg=C["mid"], anchor="w").pack(fill=tk.X)
+        self._prop_widgets = (self.cb_font, self.sp_size, self.chk_bold, self.chk_italic,
+                              self.btn_text_more, self.btn_text_drop, self.rb_bg_orig,
+                              self.rb_bg_color, self.btn_bg_more, self.btn_bg_drop,
+                              self.sp_angle, self.btn_edit, self.btn_revert, self.btn_delete)
 
-        sep = tk.Frame(inner, bg=C["line"], height=1)
-        sep.pack(fill=tk.X, pady=14)
+    def _palette(self, parent, callback):
+        pal = tk.Frame(parent, bg=C["white"])
+        pal.pack(fill=tk.X, pady=(4, 0))
+        for i, hex_col in enumerate(self.PALETTE):
+            rgb = tuple(int(hex_col[j:j + 2], 16) / 255 for j in (1, 3, 5))
+            sw = tk.Frame(pal, width=14, height=14, bg=hex_col, cursor="hand2",
+                          highlightthickness=1, highlightbackground="#888")
+            sw.grid(row=0, column=i, padx=1)
+            sw.bind("<Button-1>", lambda e, c=rgb: callback(c))
 
-        self.btn_apply = tk.Button(inner, text="✔  Valider la modification",
-                                    command=self._commit_text_edit,
-                                    font=("Helvetica", 9, "bold"),
-                                    bg=C["ok"], fg=C["white"], relief="flat",
-                                    activebackground="#0F6238",
-                                    cursor="hand2", pady=8)
-        self.btn_apply.pack(fill=tk.X, pady=(0, 6))
+    # ── Helpers ─────────────────────────────────────────────────────────────
+    def _status(self, msg):
+        self._st_var.set(msg)
 
-        self.btn_revert = tk.Button(inner, text="↺  Réinitialiser ce texte",
-                                     command=self._revert_selection,
-                                     font=("Helvetica", 8),
-                                     bg=C["white"], fg=C["text"], relief="flat",
-                                     highlightthickness=1, highlightbackground=C["line"],
-                                     cursor="hand2", pady=6)
-        self.btn_revert.pack(fill=tk.X)
+    def _zoom(self):
+        return self.ZOOMS[self._zoom_idx]
 
-        sep2 = tk.Frame(inner, bg=C["line"], height=1)
-        sep2.pack(fill=tk.X, pady=14)
+    def _eff_rotation(self):
+        return self.rotation if self.rotation else self._src_rot
 
-        self.lbl_stats = tk.Label(inner, text="", font=("Helvetica", 8),
-                                   bg=C["white"], fg=C["mid"],
-                                   justify=tk.LEFT, anchor="w")
-        self.lbl_stats.pack(fill=tk.X)
-        self._enable_controls(False)
+    def _pdf_to_cv(self, x, y):
+        p = fitz.Point(x, y) * self._mat
+        return p.x + self.MARGIN, p.y + self.MARGIN
 
-    def _enable_controls(self, enabled):
-        state = "normal" if enabled else "disabled"
-        self.txt_widget.config(state=state)
-        self.cb_font.config(state="readonly" if enabled else "disabled")
-        self.btn_apply.config(state=state)
-        self.btn_revert.config(state=state)
+    def _cv_to_pdf(self, cx, cy):
+        p = fitz.Point(cx - self.MARGIN, cy - self.MARGIN) * self._imat
+        return p.x, p.y
 
-    def _apply_color(self, which, normalized, hexv):
-        """Applique une couleur choisie (depuis palette ou chooser) immédiatement."""
-        if which == "text":
-            self.color_text = normalized
-            self.swatch_text.config(bg=hexv)
+    def _rect_to_cv(self, r):
+        rr = fitz.Rect(r) * self._mat
+        m = self.MARGIN
+        return rr.x0 + m, rr.y0 + m, rr.x1 + m, rr.y1 + m
+
+    def _event_cv(self, e):
+        return self.canvas.canvasx(e.x), self.canvas.canvasy(e.y)
+
+    def _edit_for_seg(self, key):
+        return next((e for e in self.edits
+                     if e.seg_key == key and e.kind in ("replace", "delete")), None)
+
+    def _get_edit(self, item, create=False):
+        if item is None:
+            return None
+        kind, k = item
+        if kind == "add":
+            return next((e for e in self.edits if e.kind == "add" and e.uid == k), None)
+        ed = self._edit_for_seg(k)
+        if ed is None and create:
+            ed = Edit.from_segment(self._seg_by_key[k])
+            self.edits.append(ed)
+        return ed
+
+    def _props(self, item):
+        ed = self._get_edit(item)
+        if ed is None and item is not None and item[0] == "seg":
+            ed = Edit.from_segment(self._seg_by_key[item[1]])
+        return ed
+
+    def _is_edited(self, item):
+        return item[0] == "add" or self._edit_for_seg(item[1]) is not None
+
+    def _edit_rect(self, ed):
+        font = resolve_font(self._fpg, ed, self._fcache)[2]
+        return text_rect(font, ed.text, ed.size, ed.origin, ed.angle)
+
+    def _item_rect(self, item):
+        if item[0] == "seg":
+            ed = self._edit_for_seg(item[1])
+            if ed is None:
+                return fitz.Rect(self._seg_by_key[item[1]]["bbox"])
+            return self._edit_rect(ed)
+        ed = self._get_edit(item)
+        return self._edit_rect(ed) if ed else fitz.Rect()
+
+    def _compute_items(self):
+        items = []
+        for e in self.edits:
+            if e.kind == "add":
+                items.append((("add", e.uid), self._edit_rect(e)))
+        for s in self._segments:
+            ed = self._edit_for_seg(s["key"])
+            if ed is not None and ed.kind == "delete":
+                continue
+            rect = self._edit_rect(ed) if ed else fitz.Rect(s["bbox"])
+            items.append((("seg", s["key"]), rect))
+        return items
+
+    def _hit(self, px, py):
+        best, best_area = None, None
+        pt = fitz.Point(px, py)
+        for item, r in self._items:
+            rr = fitz.Rect(r.x0 - 1.5, r.y0 - 1.5, r.x1 + 1.5, r.y1 + 1.5)
+            if rr.contains(pt):
+                area = r.width * r.height * (0.5 if item[0] == "add" else 1)
+                if best is None or area < best_area:
+                    best, best_area = item, area
+        return best
+
+    def _prune(self):
+        self.edits = [e for e in self.edits if not e.is_noop()]
+
+    def _reflow_line(self, key):
+        """Comme Word : quand un texte s'allonge ou raccourcit, la suite de la
+        ligne (textes collés sur la même ligne de base) se décale d'autant."""
+        seg = self._seg_by_key.get(key)
+        if seg is None or seg["angle"] != 0.0:
+            return
+        oy = seg["origin"][1]
+        line = sorted((s for s in self._segments if s["angle"] == 0.0
+                       and abs(s["origin"][1] - oy) < seg["size"] * 0.2),
+                      key=lambda s: s["bbox"][0])
+        shift, prev = 0.0, None
+        for s in line:
+            ed = self._edit_for_seg(s["key"])
+            attached = prev is not None and \
+                s["bbox"][0] - prev["bbox"][2] <= max(s["size"], prev["size"])
+            if not attached:
+                shift = 0.0
+            if ed is not None and ed.pinned:
+                shift = 0.0
+                prev = s
+                continue
+            if ed is not None:
+                ed.origin = (s["origin"][0] + shift, ed.origin[1])
+            elif abs(shift) > 0.01:
+                cand = Edit.from_segment(s)
+                # only shift text that can be rewritten without changing its look
+                if resolve_font(self._fpg, cand, self._fcache)[0] == "base14":
+                    shift = 0.0
+                    prev = s
+                    continue
+                cand.origin = (s["origin"][0] + shift, cand.origin[1])
+                self.edits.append(cand)
+                ed = cand
+            if ed is not None:
+                if ed.kind == "delete":
+                    shift -= s["bbox"][2] - s["bbox"][0]
+                elif "\n" in ed.text:
+                    shift = 0.0
+                else:
+                    font = resolve_font(self._fpg, ed, self._fcache)[2]
+                    shift += (font.text_length(ed.text, fontsize=ed.size)
+                              - font.text_length(s["text"], fontsize=s["size"]))
+            prev = s
+
+    def _families_list(self):
+        if self._families is None:
+            self._families = FontManager.families()
+        return self._families
+
+    def _orig_label(self, ed):
+        return f"★ Police d'origine — {font_display_name(ed.orig_font)}"
+
+    def _family_label(self, ed):
+        if ed.orig_font and ed.family == ed.orig_font:
+            return self._orig_label(ed)
+        return font_display_name(ed.family)
+
+    def _default_family(self):
+        idx = FontManager.index()
+        for key in ("arial", "liberationsans", "helvetica"):
+            if key in idx:
+                return FontManager.display(key)
+        return "Helvetica"
+
+    def _tk_family(self, name):
+        if self._tk_fams is None:
+            self._tk_fams = {f.lower(): f for f in tkfont.families(self.win)}
+        key = font_family_key(name or "")
+        disp = font_display_name(name or "")
+        for cand in [disp, disp.replace(" ", "")] + \
+                [FontManager.display(k) for k in FAMILY_ALIASES.get(key, [])]:
+            if cand and cand.lower() in self._tk_fams:
+                return self._tk_fams[cand.lower()]
+        return {"helv": "Helvetica", "tiro": "Times", "cour": "Courier"}[
+            base14_name(key, False, False)[:4]]
+
+    def _pixel(self, cx, cy):
+        x, y = int(cx - self.MARGIN), int(cy - self.MARGIN)
+        if 0 <= x < self._pil.width and 0 <= y < self._pil.height:
+            r, g, b = self._pil.getpixel((x, y))[:3]
+            return (r / 255.0, g / 255.0, b / 255.0)
+        return None
+
+    def _bg_under(self, rect):
+        x0, y0, x1, y1 = self._rect_to_cv(rect)
+        my = (y0 + y1) / 2
+        probes = [(x0 - 3, my), (x1 + 3, my), ((x0 + x1) / 2, y0 - 3),
+                  ((x0 + x1) / 2, y1 + 3), (x0 - 3, y0 - 3), (x1 + 3, y1 + 3)]
+        samples = [p for p in (self._pixel(x, y) for x, y in probes) if p]
+        if not samples:
+            return "#FFFFFF"
+        samples.sort(key=sum)
+        return _hex(samples[len(samples) // 2])
+
+    # ── Rendu (aperçu exact = même moteur que l'export) ─────────────────────
+    def _render(self):
+        if self._render_after:
+            self.win.after_cancel(self._render_after)
+            self._render_after = None
+        self._prune()
+        z = self._zoom()
+        tmp = fitz.open()
+        try:
+            tmp.insert_pdf(self._doc, from_page=self.page.pg_idx, to_page=self.page.pg_idx)
+            tp = tmp[0]
+            if tp.rotation:
+                tp.set_rotation(0)
+            try:
+                apply_edits_to_page(tp, self.edits, self._fcache)
+            except Exception as ex:
+                self._status(f"⚠  Aperçu partiel : {ex}")
+            tp.set_rotation(self._eff_rotation())
+            pix = tp.get_pixmap(matrix=fitz.Matrix(z, z), alpha=False)
+            self._mat = tp.rotation_matrix * fitz.Matrix(z, z)
+        finally:
+            tmp.close()
+        self._imat = ~self._mat
+        self._pil = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+        self._photo = ImageTk.PhotoImage(self._pil)
+        m = self.MARGIN
+        self.canvas.delete("page")
+        self.canvas.create_rectangle(m + 3, m + 3, m + pix.width + 3, m + pix.height + 3,
+                                     fill="#5E636B", outline="", tags="page")
+        self.canvas.create_image(m, m, image=self._photo, anchor="nw", tags="page")
+        self.canvas.tag_lower("page")
+        self.canvas.config(scrollregion=(0, 0, pix.width + 2 * m, pix.height + 2 * m))
+        self.lbl_zoom.config(text=f"{int(z * 100)} %")
+        self._items = self._compute_items()
+        self._draw_overlays()
+        self._update_stats()
+
+    def _schedule_render(self, snap=False):
+        if self._render_after:
+            self.win.after_cancel(self._render_after)
+
+        def run():
+            self._render_after = None
+            if self._inline is None:
+                self._render()
+            if snap:
+                self._snap()
+        self._render_after = self.win.after(120, run)
+
+    def _draw_overlays(self):
+        cv = self.canvas
+        cv.delete("ov")
+        show = self.var_showboxes.get()
+        for item, r in self._items:
+            if self._inline and self._inline["item"] == item:
+                continue
+            x0, y0, x1, y1 = self._rect_to_cv(r)
+            x0, y0, x1, y1 = x0 - 2, y0 - 2, x1 + 2, y1 + 2
+            if item == self._sel:
+                cv.create_rectangle(x0, y0, x1, y1, outline=C["blue"], width=2, tags="ov")
+            elif item == self._hover:
+                cv.create_rectangle(x0, y0, x1, y1, outline=C["char_sel"], width=1,
+                                    dash=(4, 2), tags="ov")
+            elif self._is_edited(item):
+                cv.create_rectangle(x0, y0, x1, y1, outline=C["orange"], width=1,
+                                    dash=(3, 3), tags="ov")
+            elif show:
+                cv.create_rectangle(x0, y0, x1, y1, outline="#9DC3E6", width=1,
+                                    dash=(2, 3), tags="ov")
+
+    # ── Souris ──────────────────────────────────────────────────────────────
+    def _on_motion(self, e):
+        cx, cy = self._event_cv(e)
+        if self._eyedropper:
+            self._draw_dropper(cx, cy)
+            return
+        if self._mode == "add":
+            return
+        item = self._hit(*self._cv_to_pdf(cx, cy))
+        if item != self._hover:
+            self._hover = item
+            self._draw_overlays()
+        if item is None:
+            self.canvas.config(cursor="arrow")
         else:
-            self.color_bg = normalized
-            self.swatch_bg.config(bg=hexv)
-            # Selecting a bg color means we do want a background
-            self._no_bg_var.set(False)
-        # Apply immediately without throttle
-        if self._realtime_after:
-            self.win.after_cancel(self._realtime_after)
-            self._realtime_after = None
-        self._do_realtime_update()
+            self.canvas.config(cursor="fleur" if item == self._sel else "xterm")
+
+    def _on_leave(self, e):
+        self.canvas.delete("dropper")
+        if self._hover is not None:
+            self._hover = None
+            self._draw_overlays()
+
+    def _on_wheel(self, e, horizontal=False):
+        step = -1 if e.delta > 0 else 1
+        if abs(e.delta) >= 120:
+            step *= 3
+        if horizontal:
+            self.canvas.xview_scroll(step, "units")
+        else:
+            self.canvas.yview_scroll(step, "units")
+
+    def _on_press(self, e):
+        self.canvas.focus_set()
+        cx, cy = self._event_cv(e)
+        if self._eyedropper:
+            self._pick_from_page(cx, cy)
+            return
+        px, py = self._cv_to_pdf(cx, cy)
+        if self._mode == "add":
+            self._close_inline(True)
+            self._set_mode("select")
+            self._create_text_at(px, py)
+            return
+        if self._inline:
+            self._close_inline(True)
+        item = self._hit(px, py)
+        self._press = {"item": item, "cx": cx, "cy": cy, "px": px, "py": py, "moved": False}
+        if item != self._sel:
+            self._sel = item
+            self._update_panel()
+            self._draw_overlays()
+
+    def _on_drag(self, e):
+        p = self._press
+        if not p or p["item"] is None or self._eyedropper:
+            return
+        cx, cy = self._event_cv(e)
+        if not p["moved"] and abs(cx - p["cx"]) + abs(cy - p["cy"]) < 4:
+            return
+        p["moved"] = True
+        x0, y0, x1, y1 = self._rect_to_cv(self._item_rect(p["item"]))
+        dx, dy = cx - p["cx"], cy - p["cy"]
+        self.canvas.delete("ghost")
+        self.canvas.create_rectangle(x0 + dx - 2, y0 + dy - 2, x1 + dx + 2, y1 + dy + 2,
+                                     outline=C["blue"], width=2, dash=(5, 3), tags="ghost")
+        self.canvas.config(cursor="fleur")
+
+    def _on_release(self, e):
+        p, self._press = self._press, None
+        self.canvas.delete("ghost")
+        if not p or self._eyedropper:
+            return
+        if p["item"] is None:
+            if self._sel is not None:
+                self._sel = None
+                self._update_panel()
+                self._draw_overlays()
+            return
+        if p["moved"]:
+            px, py = self._cv_to_pdf(*self._event_cv(e))
+            ed = self._get_edit(p["item"], create=True)
+            ed.origin = (ed.origin[0] + px - p["px"], ed.origin[1] + py - p["py"])
+            ed.pinned = True
+            if p["item"][0] == "seg":
+                self._reflow_line(p["item"][1])
+            self._render()
+            self._snap()
+            self._update_panel()
+            self._status("✔  Texte déplacé  ·  flèches du clavier pour ajuster finement")
+        else:
+            self._open_inline(p["item"], click_pdf=(p["px"], p["py"]))
+
+    # ── Édition directe sur la page ─────────────────────────────────────────
+    def _tk_font(self, ed):
+        px = max(5, int(round(ed.size * self._zoom())))
+        return tkfont.Font(root=self.win, family=self._tk_family(ed.family), size=-px,
+                           weight="bold" if ed.bold else "normal",
+                           slant="italic" if ed.italic else "roman")
+
+    def _place_inline(self):
+        inl = self._inline
+        ed = self._props(inl["item"])
+        if self._eff_rotation() == 0 and not ed.angle:
+            bx, by = self._pdf_to_cv(*ed.origin)
+            left, top = bx - 2, by - inl["font"].metrics("ascent") - 1
+        else:
+            x0, y0, _, _ = self._rect_to_cv(self._item_rect(inl["item"]))
+            left, top = x0 - 2, y0 - 2
+        self.canvas.coords(inl["id"], left, top)
+
+    def _open_inline(self, item, click_pdf=None, select_all=False):
+        if item is None:
+            return
+        self._close_inline(True)
+        self._cancel_eyedropper()
+        self._sel = item
+        ed = self._props(item)
+        rect = self._item_rect(item)
+        x0, y0, x1, y1 = self._rect_to_cv(rect)
+        font = self._tk_font(ed)
+        fg = _hex(ed.color)
+        bg = _hex(ed.bg) if ed.bg is not None else self._bg_under(rect)
+        w = tk.Text(self.canvas, font=font, fg=fg, bg=bg, insertbackground=fg,
+                    insertwidth=2, relief="flat", bd=0, highlightthickness=1,
+                    highlightbackground=C["blue"], highlightcolor=C["blue"],
+                    wrap="none", undo=True, padx=1, pady=0,
+                    selectbackground=C["char_sel_bg"], selectforeground="#000000")
+        w.insert("1.0", ed.text)
+        w.edit_reset()
+        # Keep the toplevel/global shortcuts (Delete, Ctrl+Z…) out of the text field
+        w.bindtags((str(w), "Text"))
+        w.bind("<Return>", self._inline_enter)
+        w.bind("<KP_Enter>", self._inline_enter)
+        w.bind("<Shift-Return>", lambda ev: None)
+        w.bind("<Escape>", lambda ev: (self._close_inline(False), "break")[1])
+        w.bind("<Tab>", self._inline_enter)
+        w.bind("<KeyRelease>", lambda ev: self._inline_autosize())
+        w.bind("<Control-a>", lambda ev: (w.tag_add("sel", "1.0", "end-1c"), "break")[1])
+        w.bind("<Control-s>", lambda ev: (self._on_save(), "break")[1])
+        wid = self.canvas.create_window(x0, y0, window=w, anchor="nw", tags="inline")
+        self._inline = {"w": w, "id": wid, "item": item, "font": font,
+                        "orig_text": ed.text, "min_w": x1 - x0 + 8}
+        self._place_inline()
+        self._inline_autosize()
+        index = "end-1c"
+        if click_pdf and item[0] == "seg" and self._edit_for_seg(item[1]) is None:
+            seg = self._seg_by_key[item[1]]
+            if seg["angle"] == 0.0 and self._eff_rotation() == 0:
+                n = sum(1 for b in seg["chars"] if (b[0] + b[2]) / 2 < click_pdf[0])
+                index = f"1.{n}"
+        w.mark_set("insert", index)
+        if select_all:
+            w.tag_add("sel", "1.0", "end-1c")
+        w.focus_set()
+        self._update_panel()
+        self._draw_overlays()
+        self._status("✏  Saisissez votre texte  ·  Entrée : valider  ·  "
+                     "Maj+Entrée : nouvelle ligne  ·  Échap : annuler")
+
+    def _inline_enter(self, e=None):
+        self._close_inline(True)
+        return "break"
+
+    def _inline_autosize(self):
+        inl = self._inline
+        if not inl:
+            return
+        font = inl["font"]
+        lines = inl["w"].get("1.0", "end-1c").split("\n")
+        width = max([font.measure(line) for line in lines] + [0]) + font.measure("  ") + 6
+        width = max(width, inl["min_w"], 30)
+        height = len(lines) * font.metrics("linespace") + 4
+        self.canvas.itemconfig(inl["id"], width=width, height=height)
+
+    def _restyle_inline(self):
+        inl = self._inline
+        if not inl:
+            return
+        ed = self._props(inl["item"])
+        font = self._tk_font(ed)
+        fg = _hex(ed.color)
+        bg = _hex(ed.bg) if ed.bg is not None else self._bg_under(self._item_rect(inl["item"]))
+        inl["w"].config(font=font, fg=fg, insertbackground=fg, bg=bg)
+        inl["font"] = font
+        self._place_inline()
+        self._inline_autosize()
+
+    def _close_inline(self, commit=True, render=True):
+        inl = self._inline
+        if not inl:
+            return False
+        self._inline = None
+        text = inl["w"].get("1.0", "end-1c")
+        try:
+            self.canvas.delete(inl["id"])
+            inl["w"].destroy()
+        except tk.TclError:
+            pass
+        item = inl["item"]
+        if commit and text != inl["orig_text"]:
+            if item[0] == "add":
+                ed = self._get_edit(item)
+                if ed is not None:
+                    if text.strip():
+                        ed.text = text
+                    else:
+                        self.edits.remove(ed)
+                        self._sel = None
+            else:
+                ed = self._get_edit(item, create=True)
+                if text.strip():
+                    ed.kind, ed.text = "replace", text
+                else:
+                    ed.kind, ed.text = "delete", ""
+                    self._sel = None
+                self._reflow_line(item[1])
+        if render:
+            self._render()
+            self._snap()
+            self._update_panel()
+            self._status("✔  Texte mis à jour" if commit else "Modification annulée")
+        self.canvas.focus_set()
+        return True
+
+    def _edit_selected(self):
+        if self._sel is not None and self._inline is None:
+            self._open_inline(self._sel)
+
+    def _edit_or_commit(self):
+        if self._inline:
+            self._close_inline(True)
+        else:
+            self._edit_selected()
+
+    def _create_text_at(self, px, py):
+        try:
+            size = float(self.var_size.get().replace(",", "."))
+        except ValueError:
+            size = 12.0
+        size = min(max(size, 4.0), 200.0)
+        family = self.var_font.get()
+        if not family or family.startswith("★"):
+            family = self._default_family()
+        ed = Edit("add", text="Nouveau texte", family=family, size=size,
+                  color=self._color, bg=self._bg, bold=self.var_bold.get(),
+                  italic=self.var_italic.get(), origin=(px, py + size * 0.35),
+                  uid=self._next_uid)
+        self._next_uid += 1
+        self.edits.append(ed)
+        self._sel = ("add", ed.uid)
+        self._render()
+        self._snap()
+        self._open_inline(self._sel, select_all=True)
+
+    # ── Propriétés ──────────────────────────────────────────────────────────
+    def _update_panel(self):
+        self._loading = True
+        try:
+            item = self._sel
+            ed = self._props(item) if item else None
+            values = ([self._orig_label(ed)] if ed is not None and ed.orig_font else []) \
+                + self._families_list()
+            self.cb_font.config(values=values)
+            if ed is None:
+                self.lbl_sel.config(
+                    text=f"{len(self._segments)} zones de texte détectées sur cette page.\n"
+                         "Cliquez sur n'importe quel texte pour le modifier directement, "
+                         "glissez-le pour le déplacer.",
+                    bg=C["bg2"], fg=C["mid"])
+                for w in self._prop_widgets:
+                    w.config(state="disabled")
+                return
+            for w in self._prop_widgets:
+                w.config(state="normal")
+            self.cb_font.config(state="readonly")
+            if item[0] == "seg":
+                seg = self._seg_by_key[item[1]]
+                state = "modifié" if self._edit_for_seg(item[1]) else "original"
+                style = ", ".join(x for x in ("gras" if seg["bold"] else "",
+                                              "italique" if seg["italic"] else "") if x)
+                warn = ""
+                kind = resolve_font(self._fpg, ed, self._fcache)[0]
+                if kind == "base14" and font_family_key(ed.family) not in (
+                        "helvetica", "times", "courier", "symbol", "zapfdingbats"):
+                    warn = ("\n⚠ Police non installée sur ce poste : "
+                            "une police proche sera utilisée pour le texte modifié.")
+                self.lbl_sel.config(
+                    text=f"Texte détecté ({state})\nPolice d'origine : "
+                         f"{font_display_name(seg['font']) or '?'}  ·  {seg['size']:g} pt"
+                         + (f"  ·  {style}" if style else "") + warn,
+                    bg=C["blue_lt"], fg=C["orange"] if warn else C["navy"])
+                self.btn_revert.config(
+                    state="normal" if self._edit_for_seg(item[1]) else "disabled")
+            else:
+                self.lbl_sel.config(text="Texte ajouté\nGlissez-le pour le déplacer.",
+                                    bg=C["blue_lt"], fg=C["navy"])
+                self.btn_revert.config(state="disabled")
+            self.btn_edit.config(text="✔  Valider le texte" if self._inline
+                                 else "✏  Modifier ce texte")
+            self.var_font.set(self._family_label(ed))
+            self.var_size.set(f"{ed.size:g}")
+            self.var_bold.set(bool(ed.bold))
+            self.var_italic.set(bool(ed.italic))
+            self._color = tuple(ed.color)
+            self.swatch_text.config(bg=_hex(ed.color))
+            self._bg = ed.bg
+            self.var_bgmode.set("orig" if ed.bg is None else "color")
+            self.swatch_bg.config(bg=_hex(ed.bg) if ed.bg is not None else C["white"])
+            self.var_angle.set(f"{ed.angle:g}")
+        finally:
+            self._loading = False
+            self._update_stats()
+
+    def _on_prop(self, field):
+        if self._loading or self._sel is None:
+            return
+        ed = self._get_edit(self._sel, create=True)
+        if field == "family":
+            value = self.var_font.get()
+            ed.family = ed.orig_font if value.startswith("★") and ed.orig_font else value
+        elif field in ("size", "angle"):
+            var = self.var_size if field == "size" else self.var_angle
+            try:
+                value = float(var.get().replace(",", "."))
+            except ValueError:
+                return
+            if field == "size":
+                if not 2 <= value <= 400:
+                    return
+                ed.size = value
+            else:
+                ed.angle = ((value + 180.0) % 360.0) - 180.0 if abs(value) > 180 else value
+        elif field == "bold":
+            ed.bold = self.var_bold.get()
+        elif field == "italic":
+            ed.italic = self.var_italic.get()
+        self._after_prop_change()
+
+    def _after_prop_change(self):
+        if self._sel is not None and self._sel[0] == "seg":
+            self._reflow_line(self._sel[1])
+        if self._inline:
+            self._restyle_inline()
+        self._schedule_render(snap=True)
+
+    def _set_text_color(self, rgb):
+        self._color = tuple(rgb)
+        self.swatch_text.config(bg=_hex(rgb))
+        if self._sel is not None and not self._loading:
+            self._get_edit(self._sel, create=True).color = tuple(rgb)
+            self._after_prop_change()
+
+    def _set_bg_color(self, rgb):
+        self._bg = tuple(rgb)
+        self.var_bgmode.set("color")
+        self.swatch_bg.config(bg=_hex(rgb))
+        if self._sel is not None and not self._loading:
+            self._get_edit(self._sel, create=True).bg = tuple(rgb)
+            self._after_prop_change()
+
+    def _on_bgmode(self):
+        if self.var_bgmode.get() == "orig":
+            if self._eyedropper == "bg":
+                self._cancel_eyedropper()
+            self._bg = None
+            self.swatch_bg.config(bg=C["white"])
+            if self._sel is not None:
+                self._get_edit(self._sel, create=True).bg = None
+                self._after_prop_change()
+        else:
+            self._start_eyedropper("bg")
 
     def _pick_color(self, which):
-        cur = self.color_text if which == "text" else self.color_bg
-        if cur is None:
-            cur = (1, 1, 1)
-        hex_cur = "#{:02x}{:02x}{:02x}".format(
-            int(cur[0]*255), int(cur[1]*255), int(cur[2]*255))
-        rgb, hexv = colorchooser.askcolor(color=hex_cur, parent=self.win)
+        cur = self._color if which == "text" else (self._bg or (1, 1, 1))
+        rgb, _ = colorchooser.askcolor(color=_hex(cur), parent=self.win)
         if rgb:
-            normalized = (rgb[0]/255, rgb[1]/255, rgb[2]/255)
-            self._apply_color(which, normalized, hexv)
+            rgb = tuple(c / 255.0 for c in rgb)
+            if which == "text":
+                self._set_text_color(rgb)
+            else:
+                self._set_bg_color(rgb)
 
+    # ── Pipette ─────────────────────────────────────────────────────────────
+    def _start_eyedropper(self, which):
+        self._eyedropper = which
+        self.canvas.config(cursor="crosshair")
+        target = "du texte" if which == "text" else "de fond"
+        self._status(f"💧  Pipette : cliquez sur la page pour prélever la couleur {target}"
+                     "  ·  Échap ou clic droit pour annuler")
+
+    def _cancel_eyedropper(self):
+        if not self._eyedropper:
+            return
+        which, self._eyedropper = self._eyedropper, None
+        self.canvas.delete("dropper")
+        self.canvas.config(cursor="arrow")
+        if which == "bg" and self._bg is None:
+            self.var_bgmode.set("orig")
+        self._status("Pipette annulée")
+
+    def _draw_dropper(self, cx, cy):
+        self.canvas.delete("dropper")
+        rgb = self._pixel(cx, cy)
+        if rgb is None:
+            return
+        x, y = cx + 18, cy + 18
+        self.canvas.create_rectangle(x, y, x + 34, y + 34, fill=_hex(rgb),
+                                     outline="#000000", width=2, tags="dropper")
+        self.canvas.create_rectangle(x, y + 36, x + 64, y + 52, fill="#FFFFFF",
+                                     outline="#888888", tags="dropper")
+        self.canvas.create_text(x + 32, y + 44, text=_hex(rgb).upper(),
+                                font=("Helvetica", 8), tags="dropper")
+
+    def _pick_from_page(self, cx, cy):
+        rgb = self._pixel(cx, cy)
+        which, self._eyedropper = self._eyedropper, None
+        self.canvas.delete("dropper")
+        self.canvas.config(cursor="arrow")
+        if rgb is None:
+            if which == "bg" and self._bg is None:
+                self.var_bgmode.set("orig")
+            self._status("⚠  Cliquez sur la page pour prélever une couleur")
+            return
+        if which == "text":
+            self._set_text_color(rgb)
+        else:
+            self._set_bg_color(rgb)
+        self._status(f"💧  Couleur prélevée : {_hex(rgb).upper()}")
+
+    # ── Actions ─────────────────────────────────────────────────────────────
     def _set_mode(self, mode):
+        if mode == "add":
+            self._close_inline(True)
         self._mode = mode
-        labels = {"select": "Sélection", "add": "Ajout de texte"}
-        self.lbl_mode.config(text=f"Mode : {labels.get(mode, mode)}")
+        self.lbl_mode.config(text="Mode : " + ("Ajout de texte" if mode == "add"
+                                               else "Modification du texte"))
         self.btn_select.config(bg=C["blue"] if mode == "select" else C["white"],
                                fg=C["white"] if mode == "select" else C["text"])
         self.btn_add.config(bg=C["blue"] if mode == "add" else C["white"],
                             fg=C["white"] if mode == "add" else C["text"])
         if mode == "add":
             self.canvas.config(cursor="crosshair")
-            self._st_var.set("Tracez un rectangle où ajouter le texte")
+            self._status("➕  Cliquez sur la page à l'endroit où ajouter le texte")
         else:
             self.canvas.config(cursor="arrow")
-            self._st_var.set("Glissez la souris pour sélectionner du texte")
+            self._status("Cliquez sur un texte pour le modifier  ·  glissez pour le déplacer"
+                         "  ·  Suppr pour l'effacer  ·  Ctrl+Z / Ctrl+Y")
 
-    # ── RENDER ──
-    def _render_page(self):
-        original_rotation = self._fpg.rotation
-        self._fpg.set_rotation(self.rotation)
-        mat = fitz.Matrix(self.RENDER_DPI, self.RENDER_DPI)
-        pix = self._fpg.get_pixmap(matrix=mat, alpha=False)
-        img_data = pix.tobytes("ppm")
-        img = Image.open(io.BytesIO(img_data))
-        self._photo = ImageTk.PhotoImage(img)
-        self._scale = self.RENDER_DPI
-        self.canvas.delete("all")
-        self._img_id = self.canvas.create_image(0, 0, image=self._photo, anchor="nw")
-        self.canvas.config(scrollregion=(0, 0, img.width, img.height))
-
-        # Extraction CARACTÈRES (rawdict) pour sélection lettre par lettre
-        self._chars = []
-        d = self._fpg.get_text("rawdict")
-        for block in d.get("blocks", []):
-            if block.get("type", 0) != 0:
-                continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    font = span.get("font", "")
-                    size = span.get("size", 11)
-                    color = self._int_to_rgb(span.get("color", 0))
-                    flags = span.get("flags", 0)
-                    for ch in span.get("chars", []):
-                        c_text = ch.get("c", "")
-                        bbox = ch.get("bbox")
-                        if not c_text or not bbox:
-                            continue
-                        self._chars.append({
-                            "bbox":  bbox,
-                            "text":  c_text,
-                            "font":  font,
-                            "size":  size,
-                            "color": color,
-                            "flags": flags,
-                        })
-
-        # Grouper en lignes pour faciliter la sélection
-        self._build_lines()
-        self._fpg.set_rotation(original_rotation)
-        self._redraw_overlays()
-        self._update_stats()
-
-    def _build_lines(self):
-        """Groupe les caractères par ligne visuelle (même y_center à tolérance)."""
-        self._lines = []
-        if not self._chars:
-            return
-        # Tri par y puis x
-        sorted_idx = sorted(range(len(self._chars)),
-                            key=lambda i: (self._chars[i]["bbox"][1],
-                                           self._chars[i]["bbox"][0]))
-        current_line = []
-        current_y = None
-        TOLERANCE = 3.0  # pts PDF
-        for i in sorted_idx:
-            ch = self._chars[i]
-            y_center = (ch["bbox"][1] + ch["bbox"][3]) / 2
-            if current_y is None or abs(y_center - current_y) <= TOLERANCE:
-                current_line.append(i)
-                current_y = y_center if current_y is None else current_y
-            else:
-                # Trier la ligne par x
-                current_line.sort(key=lambda i: self._chars[i]["bbox"][0])
-                self._lines.append((current_y, current_line))
-                current_line = [i]
-                current_y = y_center
-        if current_line:
-            current_line.sort(key=lambda i: self._chars[i]["bbox"][0])
-            self._lines.append((current_y, current_line))
-
-    def _redraw_overlays(self):
-        """Redessine tous les overlays (édits, sélection, poignées)."""
-        for tag in ("edit_overlay", "selection", "char_sel", "draw_temp",
-                    "added_box", "handle"):
-            self.canvas.delete(tag)
-
-        # Édits
-        for ed in self.edits:
-            if not ed.bbox:
-                continue
-            x0, y0, x1, y1 = [v * self._scale for v in ed.bbox]
-
-            # Whiteout pour delete et replace
-            if ed.kind in ("delete", "replace"):
-                if ed.bg is not None:
-                    fill_color = ed.bg
-                else:
-                    # Auto-detect page background to erase old text invisibly
-                    fill_color = self._get_canvas_bg_at(ed.bbox)
-                bg_hex = "#{:02x}{:02x}{:02x}".format(
-                    int(fill_color[0]*255), int(fill_color[1]*255), int(fill_color[2]*255))
-                self.canvas.create_rectangle(x0, y0, x1, y1,
-                    fill=bg_hex, outline="", tags="edit_overlay")
-
-            # Texte (replace ou add)
-            if ed.kind in ("add", "replace") and ed.text:
-                fg_hex = "#{:02x}{:02x}{:02x}".format(
-                    int(ed.color[0]*255), int(ed.color[1]*255), int(ed.color[2]*255))
-                fsize = max(6, int(ed.size * self._scale * 0.75))
-                self.canvas.create_text(x0 + 2, y0 + 2,
-                    text=ed.text, anchor="nw", fill=fg_hex,
-                    font=("Helvetica", fsize), width=(x1 - x0),
-                    tags="edit_overlay")
-
-            # Cadre orange (replace) ou bleu (add)
-            outline_color = C["selected"] if ed.kind == "add" else C["orange"]
-            self.canvas.create_rectangle(x0, y0, x1, y1,
-                outline=outline_color, width=2, dash=(4, 2),
-                tags=("edit_overlay", f"added_{ed.uid}" if ed.uid else "edit_overlay"))
-
-            # Poignées si "add" sélectionné
-            if ed.kind == "add" and ed.uid == self._added_sel_uid:
-                self._draw_handles(x0, y0, x1, y1)
-
-        # Sélection caractères (style Word)
-        if self._char_sel:
-            start, end = self._char_sel
-            for line_y, line_chars in self._lines:
-                # Trouver les chars de cette ligne dans la sélection
-                in_sel = [i for i in line_chars if start <= i <= end]
-                if not in_sel:
-                    continue
-                # Bbox englobant de la sélection sur cette ligne
-                xs0 = min(self._chars[i]["bbox"][0] for i in in_sel)
-                xs1 = max(self._chars[i]["bbox"][2] for i in in_sel)
-                ys0 = min(self._chars[i]["bbox"][1] for i in in_sel)
-                ys1 = max(self._chars[i]["bbox"][3] for i in in_sel)
-                self.canvas.create_rectangle(
-                    xs0 * self._scale, ys0 * self._scale,
-                    xs1 * self._scale, ys1 * self._scale,
-                    fill=C["char_sel_bg"], stipple="gray50",
-                    outline=C["char_sel"], width=1, tags="char_sel")
-
-    def _draw_handles(self, x0, y0, x1, y1):
-        """Dessine 8 poignées de redimensionnement autour d'un rect."""
-        s = self.HANDLE_SIZE
-        positions = [
-            ("nw", x0, y0), ("n", (x0+x1)/2, y0), ("ne", x1, y0),
-            ("w",  x0, (y0+y1)/2),                ("e", x1, (y0+y1)/2),
-            ("sw", x0, y1), ("s", (x0+x1)/2, y1), ("se", x1, y1),
-        ]
-        for name, hx, hy in positions:
-            self.canvas.create_rectangle(
-                hx - s/2, hy - s/2, hx + s/2, hy + s/2,
-                fill=C["handle"], outline=C["white"], width=1,
-                tags=("handle", f"handle_{name}"))
-
-    def _int_to_rgb(self, color_int):
-        r = ((color_int >> 16) & 0xFF) / 255.0
-        g = ((color_int >> 8) & 0xFF) / 255.0
-        b = (color_int & 0xFF) / 255.0
-        return (r, g, b)
-
-    # ── Coords ──
-    def _canvas_to_pdf(self, cx, cy):
-        cx = self.canvas.canvasx(cx)
-        cy = self.canvas.canvasy(cy)
-        return cx / self._scale, cy / self._scale
-
-    # ── Char hit-testing ──
-    def _find_char_at(self, px, py):
-        """Trouve le char le plus proche de (px, py). On accepte un peu de
-        tolérance verticale pour faciliter la sélection (Word-like)."""
-        # 1) Trouver la ligne la plus proche
-        if not self._lines:
-            return None
-        best_line = None
-        best_dy = float("inf")
-        for y_center, line_chars in self._lines:
-            ymin = min(self._chars[i]["bbox"][1] for i in line_chars)
-            ymax = max(self._chars[i]["bbox"][3] for i in line_chars)
-            if ymin <= py <= ymax:
-                return self._char_in_line(line_chars, px)
-            # Sinon, distance au centre
-            dy = min(abs(py - ymin), abs(py - ymax))
-            if dy < best_dy:
-                best_dy = dy
-                best_line = line_chars
-        # Si pas de hit direct mais ligne proche (< 8pt), accepter
-        if best_line and best_dy < 8:
-            return self._char_in_line(best_line, px)
-        return None
-
-    def _char_in_line(self, line_chars, px):
-        """Dans une ligne, trouve le char dont le centre est le plus proche de px."""
-        if not line_chars:
-            return None
-        # Si px avant le premier char → premier char
-        first_x0 = self._chars[line_chars[0]]["bbox"][0]
-        if px < first_x0:
-            return line_chars[0]
-        # Si après le dernier → dernier
-        last_x1 = self._chars[line_chars[-1]]["bbox"][2]
-        if px > last_x1:
-            return line_chars[-1]
-        # Sinon char qui contient px, ou le plus proche
-        for i in line_chars:
-            x0, _, x1, _ = self._chars[i]["bbox"]
-            if x0 <= px <= x1:
-                return i
-        # Fallback
-        return min(line_chars,
-                   key=lambda i: abs((self._chars[i]["bbox"][0] +
-                                      self._chars[i]["bbox"][2]) / 2 - px))
-
-    # ── Hit-test edits "add" ──
-    def _find_added_at(self, px, py):
-        """Renvoie l'Edit 'add' sous (px,py), ou None."""
-        for ed in self.edits:
-            if ed.kind == "add" and ed.bbox:
-                x0, y0, x1, y1 = ed.bbox
-                if x0 <= px <= x1 and y0 <= py <= y1:
-                    return ed
-        return None
-
-    def _find_handle_at(self, cx_screen, cy_screen):
-        """Renvoie le nom de la poignée sous le curseur (en coords écran), ou None."""
-        if self._added_sel_uid is None:
-            return None
-        # Trouver l'édit sélectionné
-        ed = next((e for e in self.edits if e.uid == self._added_sel_uid), None)
-        if not ed or not ed.bbox:
-            return None
-        x0, y0, x1, y1 = [v * self._scale for v in ed.bbox]
-        s = self.HANDLE_SIZE
-        # Convertir cx_screen, cy_screen en canvas coords
-        ccx = self.canvas.canvasx(cx_screen)
-        ccy = self.canvas.canvasy(cy_screen)
-        positions = [
-            ("nw", x0, y0), ("n", (x0+x1)/2, y0), ("ne", x1, y0),
-            ("w",  x0, (y0+y1)/2),                ("e", x1, (y0+y1)/2),
-            ("sw", x0, y1), ("s", (x0+x1)/2, y1), ("se", x1, y1),
-        ]
-        for name, hx, hy in positions:
-            if hx - s <= ccx <= hx + s and hy - s <= ccy <= hy + s:
-                return name
-        return None
-
-    # ── Mouse events principaux ──
-    def _on_motion(self, event):
-        if self._mode != "select":
-            return
-
-        # Curseur de redimensionnement si sur poignée
-        handle = self._find_handle_at(event.x, event.y)
-        if handle:
-            cursors = {
-                "nw": "size_nw_se", "se": "size_nw_se",
-                "ne": "size_ne_sw", "sw": "size_ne_sw",
-                "n": "size_ns", "s": "size_ns",
-                "e": "size_we", "w": "size_we",
-            }
-            self.canvas.config(cursor=cursors.get(handle, "arrow"))
-            return
-
-        px, py = self._canvas_to_pdf(event.x, event.y)
-
-        # Sur un texte ajouté ?
-        added = self._find_added_at(px, py)
-        if added:
-            self.canvas.config(cursor="fleur")
-            return
-
-        # Sur du texte existant ?
-        ch_idx = self._find_char_at(px, py)
-        if ch_idx is not None:
-            self.canvas.config(cursor="xterm")
-        else:
-            self.canvas.config(cursor="arrow")
-
-    def _on_press(self, event):
-        # Eyedropper mode: sample pixel and return
-        if self._eyedropper_which is not None:
-            cx = self.canvas.canvasx(event.x)
-            cy = self.canvas.canvasy(event.y)
-            self._sample_pixel(cx, cy)
-            return
-
-        if self._mode == "add":
-            cx = self.canvas.canvasx(event.x)
-            cy = self.canvas.canvasy(event.y)
-            self._draw_start = (cx, cy)
-            return
-
-        # Mode select
-        # 1) Poignée de redimensionnement ?
-        handle = self._find_handle_at(event.x, event.y)
-        if handle and self._added_sel_uid is not None:
-            ed = next((e for e in self.edits if e.uid == self._added_sel_uid), None)
-            if ed:
-                px, py = self._canvas_to_pdf(event.x, event.y)
-                self._added_drag_mode = f"resize-{handle}"
-                self._added_drag_start = (px, py, tuple(ed.bbox))
-                return
-
-        px, py = self._canvas_to_pdf(event.x, event.y)
-
-        # 2) Clic sur texte ajouté → sélectionne pour déplacement
-        added = self._find_added_at(px, py)
-        if added:
-            self._added_sel_uid = added.uid
-            self._char_sel = None
-            self._added_drag_mode = "move"
-            self._added_drag_start = (px, py, tuple(added.bbox))
-            self._load_added_into_panel(added)
-            self._redraw_overlays()
-            return
-
-        # 3) Sinon : début de sélection caractères
-        self._added_sel_uid = None
-        ch_idx = self._find_char_at(px, py)
-        if ch_idx is not None:
-            self._sel_dragging = True
-            self._sel_anchor = ch_idx
-            self._char_sel = (ch_idx, ch_idx)
-            self._redraw_overlays()
-        else:
-            # Clic dans le vide → désélectionner
-            self._char_sel = None
-            self._added_sel_uid = None
-            self._load_span_into_panel()
-            self._redraw_overlays()
-
-    def _on_drag(self, event):
-        # Mode add → tracé de rectangle
-        if self._mode == "add" and self._draw_start:
-            cx = self.canvas.canvasx(event.x)
-            cy = self.canvas.canvasy(event.y)
-            self.canvas.delete("draw_temp")
-            self.canvas.create_rectangle(
-                self._draw_start[0], self._draw_start[1], cx, cy,
-                outline=C["edit_sel"], width=2, dash=(3, 2), tags="draw_temp")
-            return
-
-        px, py = self._canvas_to_pdf(event.x, event.y)
-
-        # Déplacement / redimensionnement d'un édit ajouté
-        if self._added_drag_mode and self._added_drag_start:
-            ed = next((e for e in self.edits if e.uid == self._added_sel_uid), None)
-            if ed:
-                start_px, start_py, orig_bbox = self._added_drag_start
-                dx = px - start_px
-                dy = py - start_py
-                ox0, oy0, ox1, oy1 = orig_bbox
-
-                if self._added_drag_mode == "move":
-                    ed.bbox = (ox0 + dx, oy0 + dy, ox1 + dx, oy1 + dy)
-                elif self._added_drag_mode == "resize-nw":
-                    ed.bbox = (min(ox0 + dx, ox1 - 5), min(oy0 + dy, oy1 - 5), ox1, oy1)
-                elif self._added_drag_mode == "resize-ne":
-                    ed.bbox = (ox0, min(oy0 + dy, oy1 - 5), max(ox1 + dx, ox0 + 5), oy1)
-                elif self._added_drag_mode == "resize-sw":
-                    ed.bbox = (min(ox0 + dx, ox1 - 5), oy0, ox1, max(oy1 + dy, oy0 + 5))
-                elif self._added_drag_mode == "resize-se":
-                    ed.bbox = (ox0, oy0, max(ox1 + dx, ox0 + 5), max(oy1 + dy, oy0 + 5))
-                elif self._added_drag_mode == "resize-n":
-                    ed.bbox = (ox0, min(oy0 + dy, oy1 - 5), ox1, oy1)
-                elif self._added_drag_mode == "resize-s":
-                    ed.bbox = (ox0, oy0, ox1, max(oy1 + dy, oy0 + 5))
-                elif self._added_drag_mode == "resize-w":
-                    ed.bbox = (min(ox0 + dx, ox1 - 5), oy0, ox1, oy1)
-                elif self._added_drag_mode == "resize-e":
-                    ed.bbox = (ox0, oy0, max(ox1 + dx, ox0 + 5), oy1)
-
-                self._redraw_overlays()
-            return
-
-        # Sélection caractères en cours
-        if self._sel_dragging and self._sel_anchor is not None:
-            ch_idx = self._find_char_at(px, py)
-            if ch_idx is not None:
-                lo = min(self._sel_anchor, ch_idx)
-                hi = max(self._sel_anchor, ch_idx)
-                if self._char_sel != (lo, hi):
-                    self._char_sel = (lo, hi)
-                    self._redraw_overlays()
-
-    def _on_release(self, event):
-        # Mode add → finaliser le rectangle
-        if self._mode == "add" and self._draw_start:
-            cx = self.canvas.canvasx(event.x)
-            cy = self.canvas.canvasy(event.y)
-            x0 = min(self._draw_start[0], cx) / self._scale
-            y0 = min(self._draw_start[1], cy) / self._scale
-            x1 = max(self._draw_start[0], cx) / self._scale
-            y1 = max(self._draw_start[1], cy) / self._scale
-            self._draw_start = None
-            self.canvas.delete("draw_temp")
-            if (x1 - x0) > 4 and (y1 - y0) > 4:
-                self._add_text_at_bbox((x0, y0, x1, y1))
+    def _on_escape(self):
+        if self._eyedropper:
+            self._cancel_eyedropper()
+        elif self._inline:
+            self._close_inline(False)
+        elif self._mode == "add":
             self._set_mode("select")
-            return
-
-        # Fin de drag édit ajouté
-        if self._added_drag_mode:
-            self._added_drag_mode = None
-            self._added_drag_start = None
-            self._snap()
-            self._st_var.set("✔  Position/taille mise à jour")
-            return
-
-        # Fin de sélection caractères
-        if self._sel_dragging:
-            self._sel_dragging = False
-            if self._char_sel:
-                start, end = self._char_sel
-                if start == end:
-                    # Clic simple sur 1 char : sélectionner toute la ligne ou
-                    # juste ce char ? On garde le char seul.
-                    pass
-                self._load_span_into_panel()
-
-    # ── Panel pour sélection texte existant ──
-    def _load_span_into_panel(self):
-        if not self._char_sel:
-            self.lbl_sel.config(
-                text="Aucun texte sélectionné\n\nGlissez la souris\nsur du texte\npour sélectionner",
-                bg=C["bg2"], fg=C["mid"])
-            self.lbl_font_orig.config(text="")
-            self._enable_controls(False)
-            self._editing_bbox = None
-            return
-
-        start, end = self._char_sel
-        sel_chars = self._chars[start:end + 1]
-        sel_text = "".join(c["text"] for c in sel_chars)
-
-        # Bbox englobant
-        x0 = min(c["bbox"][0] for c in sel_chars)
-        y0 = min(c["bbox"][1] for c in sel_chars)
-        x1 = max(c["bbox"][2] for c in sel_chars)
-        y1 = max(c["bbox"][3] for c in sel_chars)
-        self._editing_bbox = (x0, y0, x1, y1)
-
-        self._enable_controls(True)
-        self.lbl_sel.config(
-            text=f"✓ {len(sel_text)} caractère(s) sélectionné(s)",
-            bg=C["blue_lt"], fg=C["navy"])
-
-        self.txt_widget.delete("1.0", tk.END)
-        self.txt_widget.insert("1.0", sel_text)
-
-        # Attributs du PREMIER char
-        first = sel_chars[0]
-        is_bold   = bool(first["flags"] & 16)
-        is_italic = bool(first["flags"] & 2)
-        mapped, matched = map_font(first["font"], is_bold, is_italic)
-        display_map = {
-            "helv": "Helvetica", "hebo": "Helvetica Bold",
-            "heit": "Helvetica Italic", "hebi": "Helvetica Bold Italic",
-            "tiro": "Times", "tibo": "Times Bold",
-            "tiit": "Times Italic", "tibi": "Times Bold Italic",
-            "cour": "Courier", "cobo": "Courier Bold",
-            "coit": "Courier Italic",
-        }
-        self.var_font.set(display_map.get(mapped, "Helvetica"))
-        orig = first["font"] or "(inconnue)"
-        if matched:
-            self.lbl_font_orig.config(
-                text=f"Police d'origine : {orig}  →  approximée", fg=C["mid"])
-        else:
-            self.lbl_font_orig.config(
-                text=f"⚠  Police d'origine : {orig}  →  fallback", fg=C["orange"])
-        self.var_size.set(round(first["size"], 1))
-        r, g, b = first["color"]
-        self.color_text = (r, g, b)
-        self.swatch_text.config(bg="#{:02x}{:02x}{:02x}".format(
-            int(r*255), int(g*255), int(b*255)))
-        self._detect_bg_color((x0, y0, x1, y1))
-
-    def _load_added_into_panel(self, ed):
-        """Charge un édit 'add' dans le panneau pour édition."""
-        self._editing_bbox = tuple(ed.bbox)
-        self._enable_controls(True)
-        self.lbl_sel.config(
-            text=f"✓ Texte ajouté sélectionné\n(déplaçable / redimensionnable)",
-            bg=C["blue_lt"], fg=C["navy"])
-        self.txt_widget.delete("1.0", tk.END)
-        self.txt_widget.insert("1.0", ed.text)
-        display_map = {
-            "helv": "Helvetica", "hebo": "Helvetica Bold",
-            "heit": "Helvetica Italic", "hebi": "Helvetica Bold Italic",
-            "tiro": "Times", "tibo": "Times Bold",
-            "tiit": "Times Italic", "tibi": "Times Bold Italic",
-            "cour": "Courier", "cobo": "Courier Bold",
-            "coit": "Courier Italic",
-        }
-        self.var_font.set(display_map.get(ed.font, "Helvetica"))
-        self.lbl_font_orig.config(text="(texte ajouté manuellement)", fg=C["mid"])
-        self.var_size.set(round(ed.size, 1))
-        r, g, b = ed.color
-        self.color_text = (r, g, b)
-        self.swatch_text.config(bg="#{:02x}{:02x}{:02x}".format(
-            int(r*255), int(g*255), int(b*255)))
-        if ed.bg is None:
-            self._no_bg_var.set(True)
-            self.color_bg = (1, 1, 1)
-            self.swatch_bg.config(bg="#FFFFFF")
-        else:
-            self._no_bg_var.set(False)
-            r, g, b = ed.bg
-            self.color_bg = (r, g, b)
-            self.swatch_bg.config(bg="#{:02x}{:02x}{:02x}".format(
-                int(r*255), int(g*255), int(b*255)))
-
-    def _detect_bg_color(self, bbox):
-        try:
-            x0, y0, x1, y1 = bbox
-            sample_y = max(0, y0 - 2)
-            sample_x = (x0 + x1) / 2
-            mat = fitz.Matrix(2, 2)
-            pix = self._fpg.get_pixmap(matrix=mat,
-                clip=fitz.Rect(sample_x - 1, sample_y - 1,
-                               sample_x + 1, sample_y + 1))
-            if pix.samples:
-                r = pix.samples[0] / 255.0
-                g = pix.samples[1] / 255.0
-                b = pix.samples[2] / 255.0
-                self.color_bg = (r, g, b)
-                self.swatch_bg.config(bg="#{:02x}{:02x}{:02x}".format(
-                    int(r*255), int(g*255), int(b*255)))
-                return
-        except Exception:
-            pass
-        self.color_bg = (1, 1, 1)
-        self.swatch_bg.config(bg="#FFFFFF")
-
-    def _get_canvas_bg_at(self, bbox):
-        """Sample the PDF page background color around bbox for transparent overlay."""
-        try:
-            x0, y0, x1, y1 = bbox
-            pr = self._fpg.rect
-            mx, my = (x0 + x1) / 2, (y0 + y1) / 2
-            probes = [
-                (x0 - 3, my), (x1 + 3, my),
-                (mx, y0 - 3), (mx, y1 + 3),
-                (x0 - 3, y0 - 3), (x1 + 3, y0 - 3),
-                (x0 - 3, y1 + 3), (x1 + 3, y1 + 3),
-            ]
-            samples = []
-            for px, py in probes:
-                px = max(pr.x0 + 1, min(pr.x1 - 1, px))
-                py = max(pr.y0 + 1, min(pr.y1 - 1, py))
-                pix = self._fpg.get_pixmap(
-                    matrix=fitz.Matrix(1, 1),
-                    clip=fitz.Rect(px - 1, py - 1, px + 1, py + 1))
-                if pix.samples and len(pix.samples) >= 3:
-                    samples.append((pix.samples[0], pix.samples[1], pix.samples[2]))
-            if samples:
-                samples.sort(key=lambda s: s[0] + s[1] + s[2])
-                mid = samples[len(samples) // 2]
-                return (mid[0] / 255.0, mid[1] / 255.0, mid[2] / 255.0)
-        except Exception:
-            pass
-        return (1.0, 1.0, 1.0)
-
-    def _on_no_bg_change(self):
-        """Called when the 'no background' checkbox changes."""
-        if self._realtime_after:
-            self.win.after_cancel(self._realtime_after)
-            self._realtime_after = None
-        self._do_realtime_update()
-
-    def _start_eyedropper(self, which):
-        """Enter eyedropper mode: next click on canvas samples the pixel color."""
-        self._eyedropper_which = which
-        self.canvas.config(cursor="crosshair")
-        self._st_var.set("🔍  Cliquez sur la page pour prélever une couleur…")
-
-    def _sample_pixel(self, canvas_x, canvas_y):
-        """Sample the PDF pixel at the given canvas coordinates."""
-        px = canvas_x / self._scale
-        py = canvas_y / self._scale
-        try:
-            mat = fitz.Matrix(2, 2)
-            pix = self._fpg.get_pixmap(
-                matrix=mat,
-                clip=fitz.Rect(px - 0.5, py - 0.5, px + 0.5, py + 0.5))
-            if pix.samples and len(pix.samples) >= 3:
-                r = pix.samples[0] / 255.0
-                g = pix.samples[1] / 255.0
-                b = pix.samples[2] / 255.0
-                hexv = "#{:02x}{:02x}{:02x}".format(int(r*255), int(g*255), int(b*255))
-                which = self._eyedropper_which
-                self._eyedropper_which = None
-                self.canvas.config(cursor="arrow")
-                self._apply_color(which, (r, g, b), hexv)
-                self._st_var.set(f"🎨  Couleur prélevée : {hexv}")
-                return
-        except Exception:
-            pass
-        self._eyedropper_which = None
-        self.canvas.config(cursor="arrow")
-        self._st_var.set("⚠  Impossible de prélever la couleur")
-
-    def _font_display_to_key(self, display):
-        mapping = {
-            "Helvetica": "helv", "Helvetica Bold": "hebo",
-            "Helvetica Italic": "heit", "Helvetica Bold Italic": "hebi",
-            "Times": "tiro", "Times Bold": "tibo",
-            "Times Italic": "tiit", "Times Bold Italic": "tibi",
-            "Courier": "cour", "Courier Bold": "cobo",
-            "Courier Italic": "coit",
-        }
-        return mapping.get(display, "helv")
-
-    # ── Édition TEMPS RÉEL ──
-    def _on_text_change(self, event=None):
-        """Appelée à chaque frappe / changement de paramètre.
-        Met à jour l'overlay sans snapshotter (on snapshotte au commit).
-        Throttle pour éviter de saturer."""
-        if self._editing_bbox is None:
-            return
-        # Annuler le précédent throttle
-        if self._realtime_after:
-            self.win.after_cancel(self._realtime_after)
-        self._realtime_after = self.win.after(80, self._do_realtime_update)
-
-    def _do_realtime_update(self):
-        """Construit l'édit en cours et met à jour l'overlay live."""
-        self._realtime_after = None
-        if self._editing_bbox is None:
-            return
-        try:
-            new_text = self.txt_widget.get("1.0", "end-1c")
-            font = self._font_display_to_key(self.var_font.get())
-            size = float(self.var_size.get())
-        except Exception:
-            return
-
-        effective_bg = None if self._no_bg_var.get() else self.color_bg
-
-        # Si c'est un édit 'add' sélectionné, on modifie l'édit existant
-        if self._added_sel_uid is not None:
-            ed = next((e for e in self.edits if e.uid == self._added_sel_uid), None)
-            if ed:
-                ed.text  = new_text
-                ed.font  = font
-                ed.size  = size
-                ed.color = self.color_text
-                ed.bg    = effective_bg
-                self._redraw_overlays()
-            return
-
-        # Sinon, c'est une sélection de texte existant → édit "preview"
-        # On crée/met à jour l'édit replace pour visualiser
-        ed = self._find_edit_by_bbox(self._editing_bbox)
-        if ed is None:
-            ed = Edit(
-                kind="replace", bbox=self._editing_bbox, text=new_text,
-                font=font, size=size, color=self.color_text, bg=effective_bg,
-            )
-            self.edits.append(ed)
-        else:
-            ed.text  = new_text
-            ed.font  = font
-            ed.size  = size
-            ed.color = self.color_text
-            ed.bg    = effective_bg
-        self._redraw_overlays()
-
-    def _find_edit_by_bbox(self, bbox):
-        for ed in self.edits:
-            if ed.bbox == bbox and ed.kind in ("replace", "delete"):
-                return ed
-        return None
-
-    def _commit_text_edit(self):
-        """Validation explicite (snapshot pour undo)."""
-        if self._editing_bbox is None:
-            return
-        # S'assurer que l'édit reflète bien l'état actuel
-        self._do_realtime_update()
-        self._snap()
-        self._st_var.set("✔  Modification validée")
+        elif self._sel is not None:
+            self._sel = None
+            self._update_panel()
+            self._draw_overlays()
 
     def _delete_selected(self):
-        """Supprime soit la sélection caractères, soit le texte ajouté."""
-        # Texte ajouté sélectionné → on supprime l'édit
-        if self._added_sel_uid is not None:
-            self.edits = [e for e in self.edits if e.uid != self._added_sel_uid]
-            self._added_sel_uid = None
-            self._editing_bbox = None
-            self._load_span_into_panel()
-            self._redraw_overlays()
-            self._snap()
-            self._st_var.set("🗑  Texte ajouté supprimé")
+        item = self._sel
+        if item is None:
+            self._status("⚠  Sélectionnez d'abord un texte")
             return
-
-        if self._char_sel is None:
-            self._st_var.set("⚠  Rien à supprimer")
-            return
-
-        start, end = self._char_sel
-        sel_chars = self._chars[start:end + 1]
-        x0 = min(c["bbox"][0] for c in sel_chars)
-        y0 = min(c["bbox"][1] for c in sel_chars)
-        x1 = max(c["bbox"][2] for c in sel_chars)
-        y1 = max(c["bbox"][3] for c in sel_chars)
-        self._detect_bg_color((x0, y0, x1, y1))
-        # Retirer un éventuel édit replace existant sur ce bbox
-        self.edits = [e for e in self.edits if e.bbox != (x0, y0, x1, y1)]
-        ed = Edit(kind="delete", bbox=(x0, y0, x1, y1), bg=self.color_bg)
-        self.edits.append(ed)
-        self._char_sel = None
-        self._editing_bbox = None
-        self._load_span_into_panel()
-        self._redraw_overlays()
+        self._close_inline(False, render=False)
+        if item[0] == "add":
+            ed = self._get_edit(item)
+            if ed is not None:
+                self.edits.remove(ed)
+        else:
+            ed = self._get_edit(item, create=True)
+            ed.kind, ed.text = "delete", ""
+            self._reflow_line(item[1])
+        self._sel = None
+        self._render()
         self._snap()
-        self._st_var.set("🗑  Texte supprimé")
+        self._update_panel()
+        self._status("🗑  Texte supprimé  ·  Ctrl+Z pour annuler")
 
-    def _add_text_at_bbox(self, bbox):
-        """Crée immédiatement un édit 'add' déplaçable, sans dialogue."""
-        uid = self._next_uid
-        self._next_uid += 1
-        ed = Edit(
-            kind="add", bbox=bbox, text="Nouveau texte",
-            font=self._font_display_to_key(self.var_font.get()),
-            size=float(self.var_size.get()),
-            color=self.color_text, bg=(1, 1, 1), uid=uid,
-        )
-        self.edits.append(ed)
-        self._added_sel_uid = uid
-        self._char_sel = None
-        self._load_added_into_panel(ed)
-        self._redraw_overlays()
+    def _revert_selected(self):
+        item = self._sel
+        if item is None or item[0] != "seg":
+            return
+        self._close_inline(False, render=False)
+        self.edits = [e for e in self.edits if e.seg_key != item[1]]
+        self._reflow_line(item[1])
+        self._render()
         self._snap()
-        self._st_var.set("➕  Texte ajouté — Modifiez-le dans le panneau, déplacez-le ou redimensionnez-le")
-        # Focus sur la zone de texte pour modif immédiate
-        self.txt_widget.focus_set()
-        self.txt_widget.tag_add(tk.SEL, "1.0", tk.END)
+        self._update_panel()
+        self._status("↺  Texte d'origine rétabli")
 
-    def _revert_selection(self):
-        """Annule l'édit sur la sélection actuelle."""
-        if self._added_sel_uid is not None:
-            self.edits = [e for e in self.edits if e.uid != self._added_sel_uid]
-            self._added_sel_uid = None
-            self._editing_bbox = None
-            self._load_span_into_panel()
-            self._redraw_overlays()
-            self._snap()
-            self._st_var.set("↺  Texte ajouté supprimé")
+    def _nudge(self, dx, dy):
+        if self._inline or self._sel is None:
             return
-        if self._editing_bbox is None:
-            return
-        before = len(self.edits)
-        self.edits = [e for e in self.edits if e.bbox != self._editing_bbox]
-        if len(self.edits) != before:
-            self._redraw_overlays()
-            self._snap()
-            self._st_var.set("↺  Modification annulée pour ce texte")
+        m = self._imat
+        dpx, dpy = dx * m.a + dy * m.c, dx * m.b + dy * m.d
+        ed = self._get_edit(self._sel, create=True)
+        ed.origin = (ed.origin[0] + dpx, ed.origin[1] + dpy)
+        ed.pinned = True
+        if self._sel[0] == "seg":
+            self._reflow_line(self._sel[1])
+        self._items = self._compute_items()
+        self._draw_overlays()
+        self._schedule_render(snap=True)
 
     def _rotate(self, delta):
-        self.rotation = (self.rotation + delta) % 360
-        self._char_sel = None
-        self._added_sel_uid = None
-        self._editing_bbox = None
-        self._render_page()
-        self._load_span_into_panel()
+        self._close_inline(True, render=False)
+        self.rotation = (self._eff_rotation() + delta) % 360
+        self._render()
         self._snap()
-        self._st_var.set(f"⟳  Rotation appliquée : {self.rotation}°")
+        self._status(f"⟳  Rotation de la page : {self._eff_rotation()}°")
+
+    def _set_zoom(self, delta):
+        idx = min(max(self._zoom_idx + delta, 0), len(self.ZOOMS) - 1)
+        if idx == self._zoom_idx:
+            return
+        self._close_inline(True, render=False)
+        self._zoom_idx = idx
+        self._render()
 
     def _update_stats(self):
-        n_del = sum(1 for e in self.edits if e.kind == "delete")
         n_rep = sum(1 for e in self.edits if e.kind == "replace")
+        n_del = sum(1 for e in self.edits if e.kind == "delete")
         n_add = sum(1 for e in self.edits if e.kind == "add")
         self.lbl_stats.config(
-            text=(f"État de la page :\n"
-                  f"  • Rotation : {self.rotation}°\n"
-                  f"  • Suppressions : {n_del}\n"
-                  f"  • Modifications : {n_rep}\n"
-                  f"  • Ajouts : {n_add}\n"
-                  f"  • Total édits : {len(self.edits)}\n"
-                  f"  • Caractères extraits : {len(self._chars)}"))
+            text=f"Zones détectées : {len(self._segments)}\n"
+                 f"Modifiés : {n_rep}  ·  Supprimés : {n_del}  ·  Ajoutés : {n_add}\n"
+                 f"Rotation de la page : {self._eff_rotation()}°")
 
-    # ── Undo/Redo locaux ──
+    # ── Annuler / Rétablir ──────────────────────────────────────────────────
+    def _signature(self):
+        return (self.rotation, tuple(e.state() + (e.uid, e.seg_key) for e in self.edits))
+
     def _snap(self):
+        sig = self._signature()
+        if self._hist and self._hist[self._hist_idx]["sig"] == sig:
+            self._upd_btns()
+            return
         self._hist = self._hist[: self._hist_idx + 1]
-        self._hist.append({
-            "rotation": self.rotation,
-            "edits":    copy.deepcopy(self.edits),
-        })
+        self._hist.append({"sig": sig, "rotation": self.rotation,
+                           "edits": copy.deepcopy(self.edits)})
         if len(self._hist) > self._max_hist:
             self._hist.pop(0)
         else:
@@ -1978,72 +2373,78 @@ class PageEditor:
         self._upd_btns()
         self._update_stats()
 
-    def _undo(self):
-        if self._hist_idx <= 0:
-            self._st_var.set("Rien à annuler")
-            return
-        self._hist_idx -= 1
-        s = self._hist[self._hist_idx]
-        rotation_changed = (s["rotation"] != self.rotation)
+    def _restore(self, idx, msg):
+        self._close_inline(False, render=False)
+        self._hist_idx = idx
+        s = self._hist[idx]
         self.rotation = s["rotation"]
-        self.edits    = copy.deepcopy(s["edits"])
-        self._char_sel = None
-        self._added_sel_uid = None
-        self._editing_bbox = None
-        if rotation_changed:
-            self._render_page()
-        else:
-            self._redraw_overlays()
-        self._load_span_into_panel()
+        self.edits = copy.deepcopy(s["edits"])
+        self._sel = None
+        self._render()
+        self._update_panel()
         self._upd_btns()
-        self._update_stats()
-        self._st_var.set("↶  Annulé")
+        self._status(msg)
+
+    def _undo(self):
+        if self._inline:
+            self._close_inline(True)
+        if self._hist_idx <= 0:
+            self._status("Rien à annuler")
+            return
+        self._restore(self._hist_idx - 1, "↶  Annulé")
 
     def _redo(self):
         if self._hist_idx >= len(self._hist) - 1:
-            self._st_var.set("Rien à rétablir")
+            self._status("Rien à rétablir")
             return
-        self._hist_idx += 1
-        s = self._hist[self._hist_idx]
-        rotation_changed = (s["rotation"] != self.rotation)
-        self.rotation = s["rotation"]
-        self.edits    = copy.deepcopy(s["edits"])
-        self._char_sel = None
-        self._added_sel_uid = None
-        self._editing_bbox = None
-        if rotation_changed:
-            self._render_page()
-        else:
-            self._redraw_overlays()
-        self._load_span_into_panel()
-        self._upd_btns()
-        self._update_stats()
-        self._st_var.set("↷  Rétabli")
+        self._restore(self._hist_idx + 1, "↷  Rétabli")
 
     def _upd_btns(self):
-        self.btn_eundo.config(
-            state="normal" if self._hist_idx > 0 else "disabled")
+        self.btn_eundo.config(state="normal" if self._hist_idx > 0 else "disabled")
         self.btn_eredo.config(
             state="normal" if self._hist_idx < len(self._hist) - 1 else "disabled")
 
+    # ── Enregistrer / fermer ────────────────────────────────────────────────
+    def _make_thumb(self):
+        tmp = fitz.open()
+        try:
+            tmp.insert_pdf(self._doc, from_page=self.page.pg_idx, to_page=self.page.pg_idx)
+            tp = tmp[0]
+            tp.set_rotation(0)
+            apply_edits_to_page(tp, self.edits, self._fcache)
+            tp.set_rotation(self._src_rot)
+            pix = tp.get_pixmap(matrix=fitz.Matrix(0.30, 0.30), alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            return img.resize((THUMB_W, THUMB_H), Image.LANCZOS)
+        except Exception:
+            return None
+        finally:
+            tmp.close()
+
     def _on_save(self):
-        # Commit any pending real-time edit before saving
-        if self._realtime_after:
-            self.win.after_cancel(self._realtime_after)
-            self._realtime_after = None
-        if self._editing_bbox is not None:
-            self._do_realtime_update()
-        self.app.on_editor_save(self.pos, self.rotation, self.edits)
-        self._doc.close()
-        self.win.destroy()
+        self._close_inline(True, render=False)
+        self._prune()
+        thumb = self._make_thumb() if self.edits else None
+        self.app.on_editor_save(self.pos, self.rotation, self.edits, thumb)
+        self._close()
 
     def _on_cancel(self):
-        if self.edits != self.page.edits or self.rotation != self.page.rotation:
+        typing = self._inline and self._inline["w"].get("1.0", "end-1c") != self._inline["orig_text"]
+        if self._hist_idx > 0 or typing:
             if not messagebox.askyesno("Confirmer",
-                "Annuler les modifications non enregistrées ?",
-                parent=self.win):
+                                       "Fermer sans enregistrer les modifications ?",
+                                       parent=self.win):
                 return
-        self._doc.close()
+        self._close()
+
+    def _close(self):
+        if self._render_after:
+            self.win.after_cancel(self._render_after)
+            self._render_after = None
+        try:
+            self._doc.close()
+        except Exception:
+            pass
         self.win.destroy()
 
 
