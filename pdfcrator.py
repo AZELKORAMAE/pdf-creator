@@ -69,6 +69,7 @@ PAD_Y   = 14
 #  MOTEUR TEXTE  —  détection des textes, polices, remplacement réel
 # ══════════════════════════════════════════════════════════════════════════════
 LINE_H = 1.2
+UNREADABLE = "\ufffd"
 
 _STYLE_SUFFIXES = ("bolditalic", "boldoblique", "semibold", "demibold", "extrabold",
                    "bold", "italic", "oblique", "regular", "medium", "normal",
@@ -297,7 +298,11 @@ def _embedded_font_buffer(page, orig_font):
             xref, ext, ftype, basefont = f[0], f[1], f[2], f[3]
             if ext == "n/a" or ftype == "Type3":
                 continue
-            if basefont.split("+", 1)[-1] == target:
+            # Subset fonts ("ABCDEF+Name") keep only some glyphs and their internal
+            # character table may be stale (letters then render as boxes): never reuse.
+            if re.match(r"^[A-Z]{6}\+", basefont):
+                continue
+            if basefont == target:
                 buf = page.parent.extract_font(xref)[3]
                 if buf:
                     return buf
@@ -485,6 +490,9 @@ def apply_edits_to_page(page, edits, cache=None):
     if rot:
         page.set_rotation(0)
     try:
+        # Text that could not be decoded (U+FFFD) is never rewritten: the original
+        # stays untouched until the user retypes it.
+        edits = [ed for ed in edits if not (ed.kind == "replace" and UNREADABLE in (ed.text or ""))]
         writes = [(ed, resolve_font(page, ed, cache)) for ed in edits
                   if ed.kind in ("replace", "add") and (ed.text or "").strip()]
         n = 0
@@ -1737,6 +1745,10 @@ class PageEditor:
                 continue
             if ed is not None:
                 ed.origin = (s["origin"][0] + shift, ed.origin[1])
+            elif abs(shift) > 0.01 and UNREADABLE in s["text"]:
+                shift = 0.0
+                prev = s
+                continue
             elif abs(shift) > 0.01:
                 cand = Edit.from_segment(s)
                 # only shift text that can be rewritten without changing its look
@@ -2124,6 +2136,8 @@ class PageEditor:
                 n = sum(1 for b in seg["chars"] if (b[0] + b[2]) / 2 < click_pdf[0])
                 index = f"1.{n}"
         w.mark_set("insert", index)
+        if UNREADABLE in ed.text:
+            select_all = True
         if select_all:
             w.tag_add("sel", "1.0", "end-1c")
         w.focus_set()
@@ -2248,6 +2262,9 @@ class PageEditor:
                 style = ", ".join(x for x in ("gras" if seg["bold"] else "",
                                               "italique" if seg["italic"] else "") if x)
                 warn = ""
+                if UNREADABLE in seg["text"]:
+                    warn += ("\n⚠ Caractères illisibles (�) dans ce PDF : retapez le "
+                             "texte complet, sinon il reste inchangé.")
                 kind = resolve_font(self._fpg, ed, self._fcache)[0]
                 if kind == "base14" and font_family_key(ed.family) not in (
                         "helvetica", "times", "courier", "symbol", "zapfdingbats"):
