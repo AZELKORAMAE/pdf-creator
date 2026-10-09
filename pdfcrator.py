@@ -23,6 +23,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import os
 
 try:
@@ -91,7 +92,8 @@ def font_family_key(name):
     """'ABCDEF+Arial-BoldMT' -> 'arial' ; 'Times New Roman Bold' -> 'timesnewroman'."""
     if not name:
         return ""
-    n = name.split("+", 1)[-1]
+    n = re.sub(r"#([0-9A-Fa-f]{2})", lambda m: chr(int(m.group(1), 16)), name)
+    n = n.split("+", 1)[-1]
     n = re.split(r"[-,]", n, maxsplit=1)[0]
     n = re.sub(r"[^a-z0-9]", "", n.lower())
     changed = True
@@ -254,7 +256,13 @@ class FontManager:
     @classmethod
     def find_file(cls, fam_key, bold, italic):
         idx = cls.index()
-        for key in [fam_key] + FAMILY_ALIASES.get(fam_key, []):
+        keys = [fam_key] + FAMILY_ALIASES.get(fam_key, [])
+        if fam_key and fam_key not in idx:
+            # e.g. 'arial20' / 'arialmtbold' -> installed family 'arial'
+            prefixes = [k for k in idx if len(k) >= 4 and fam_key.startswith(k)]
+            if prefixes:
+                keys.insert(1, max(prefixes, key=len))
+        for key in keys:
             cands = idx.get(key)
             if cands:
                 best = max(cands, key=lambda c: (c[1] == bool(bold)) * 2 + (c[2] == bool(italic)))
@@ -275,20 +283,20 @@ class FontManager:
         return f
 
 
-def _covers(font, text):
-    """Vrai si la police contient un vrai glyphe pour chaque caractère du texte
-    (les polices 'subset' des PDF n'ont souvent que les lettres déjà utilisées)."""
-    try:
-        for ch in set(text):
-            if ch.isspace():
-                continue
-            if not font.has_glyph(ord(ch)):
-                return False
-            if font.glyph_bbox(ord(ch)).is_empty:
-                return False
-        return True
-    except Exception:
-        return False
+def missing_glyphs(font, text):
+    """Caractères visibles du texte sans vrai glyphe dans la police (les polices
+    'subset' des PDF n'ont souvent que les lettres déjà utilisées). Les caractères
+    invisibles (espaces, tirets conditionnels, espaces de largeur nulle…) sont ignorés."""
+    missing = set()
+    for ch in set(text):
+        if ch.isspace() or unicodedata.category(ch) in ("Cc", "Cf", "Zs", "Zl", "Zp"):
+            continue
+        try:
+            if not font.has_glyph(ord(ch)) or font.glyph_bbox(ord(ch)).is_empty:
+                missing.add(ch)
+        except Exception:
+            missing.add(ch)
+    return missing
 
 
 def _embedded_font_buffer(page, orig_font):
@@ -324,6 +332,7 @@ def resolve_font(page, ed, cache=None):
         return cache[ck]
     res = None
     fam = font_family_key(ed.family)
+    fam_keys = list(dict.fromkeys(k for k in (fam, font_family_key(font_display_name(ed.family))) if k))
     same_style = (ed.orig_font and ed.family == ed.orig_font
                   and ed.orig_style == (bool(ed.bold), bool(ed.italic)))
     if same_style and page is not None:
@@ -335,22 +344,34 @@ def resolve_font(page, ed, cache=None):
             key = "emb:" + hashlib.md5(buf).hexdigest()
             try:
                 font = FontManager.font(key, buffer=buf)
-                if _covers(font, text):
+                if not missing_glyphs(font, text):
                     res = ("buffer", buf, font, key)
             except Exception:
                 pass
+    partial = None
     if res is None:
-        path = FontManager.find_file(fam, ed.bold, ed.italic)
-        if path:
+        for k in fam_keys:
+            path = FontManager.find_file(k, ed.bold, ed.italic)
+            if not path:
+                continue
             try:
                 font = FontManager.font(path, path=path)
-                if _covers(font, text):
-                    res = ("file", path, font, path)
             except Exception:
-                pass
+                continue
+            miss = missing_glyphs(font, text)
+            if not miss:
+                res = ("file", path, font, path)
+                break
+            if partial is None or len(miss) < partial[0]:
+                partial = (len(miss), ("file", path, font, path))
     if res is None:
         b14 = base14_name(fam, ed.bold, ed.italic)
-        res = ("base14", b14, FontManager.font(b14, base14=b14), b14)
+        b14_font = FontManager.font(b14, base14=b14)
+        # keep the installed family if the standard font would not do better
+        if partial is not None and partial[0] <= len(missing_glyphs(b14_font, text)):
+            res = partial[1]
+        else:
+            res = ("base14", b14, b14_font, b14)
     cache[ck] = res
     return res
 
@@ -2265,11 +2286,16 @@ class PageEditor:
                 if UNREADABLE in seg["text"]:
                     warn += ("\n⚠ Caractères illisibles (�) dans ce PDF : retapez le "
                              "texte complet, sinon il reste inchangé.")
-                kind = resolve_font(self._fpg, ed, self._fcache)[0]
+                kind, _, used, _ = resolve_font(self._fpg, ed, self._fcache)
+                miss = missing_glyphs(used, ed.text)
                 if kind == "base14" and font_family_key(ed.family) not in (
                         "helvetica", "times", "courier", "symbol", "zapfdingbats"):
-                    warn = ("\n⚠ Police non installée sur ce poste : "
-                            "une police proche sera utilisée pour le texte modifié.")
+                    warn += (f"\n⚠ Police « {ed.family} » introuvable parmi les "
+                             f"{len(FontManager.index())} familles installées : "
+                             "une police proche sera utilisée.")
+                if miss:
+                    warn += ("\n⚠ Caractères absents de la police : "
+                             + " ".join(f"U+{ord(c):04X}" for c in sorted(miss)[:6]))
                 angle = f"\nRotation : {ed.angle:g}°" if ed.angle else ""
                 self.lbl_sel.config(
                     text=f"Texte détecté ({state})\nPolice d'origine : "
