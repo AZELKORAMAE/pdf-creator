@@ -525,6 +525,40 @@ def apply_edits_to_page(page, edits, cache=None):
             page.set_rotation(rot)
 
 
+def open_pdf(path):
+    """Ouvre un PDF depuis la mémoire : aucun fichier ne reste ouvert/verrouillé
+    (Windows interdit sinon de réenregistrer par-dessus un fichier chargé)."""
+    with open(path, "rb") as fh:
+        return fitz.open(stream=fh.read(), filetype="pdf")
+
+
+class FileLockedError(Exception):
+    pass
+
+
+def save_pdf_atomic(doc, out):
+    """Écrit dans un fichier temporaire du même dossier puis remplace la cible :
+    le fichier existant n'est jamais abîmé si l'enregistrement échoue."""
+    folder = os.path.dirname(os.path.abspath(out))
+    tmp = os.path.join(folder, f".~{os.getpid()}_{threading.get_ident()}_{os.path.basename(out)}")
+    try:
+        doc.save(tmp, garbage=4, deflate=True)
+        try:
+            os.replace(tmp, out)
+        except PermissionError:
+            raise FileLockedError(out)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def same_file(a, b):
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
+
+
 class Edit:
     """Une modification de texte sur une page.
     kind : 'replace' (texte détecté modifié), 'delete' (texte détecté supprimé),
@@ -613,6 +647,7 @@ class PDFMergerPro:
 
         self.pages = []
         self._raw_thumbs = {}
+        self._generation = 0
         self._drag_src = None
         self._drag_slot = None
         self._ghost_win = None
@@ -826,7 +861,7 @@ class PDFMergerPro:
             fname = Path(path).name
             try:
                 if HAS_FITZ and HAS_PIL:
-                    doc  = fitz.open(path)
+                    doc  = open_pdf(path)
                     imgs = []
                     for i in range(doc.page_count):
                         pg  = doc[i]
@@ -1197,31 +1232,60 @@ class PDFMergerPro:
         try:
             out_doc = fitz.open()
             src_docs = {}
-            for page in self.pages:
-                if page.path not in src_docs:
-                    src_docs[page.path] = fitz.open(page.path)
-                src = src_docs[page.path]
-                out_doc.insert_pdf(src, from_page=page.pg_idx, to_page=page.pg_idx)
-                new_pg = out_doc[-1]
-                self._apply_edits(new_pg, page.edits)
-                if page.rotation:
-                    new_pg.set_rotation(page.rotation)
-            self._subset_fonts(out_doc, self.pages)
-            out_doc.save(out, garbage=4, deflate=True)
-            out_doc.close()
-            for d in src_docs.values():
-                d.close()
-            nf = len({p.path for p in self.pages})
-            ne = sum(len(p.edits) for p in self.pages)
-            msg = (f"PDF exporté avec succès !\n\n"
-                   f"Fichier : {out}\n"
-                   f"Pages : {len(self.pages)}  ·  Sources : {nf}\n"
-                   f"Édits appliqués : {ne}")
-            self._st(f"✔  Exporté — {len(self.pages)} pages, {ne} édits", ok=True)
-            messagebox.showinfo("Succès", msg)
+            try:
+                for page in self.pages:
+                    if page.path not in src_docs:
+                        src_docs[page.path] = open_pdf(page.path)
+                    src = src_docs[page.path]
+                    out_doc.insert_pdf(src, from_page=page.pg_idx, to_page=page.pg_idx)
+                    new_pg = out_doc[-1]
+                    self._apply_edits(new_pg, page.edits)
+                    if page.rotation:
+                        new_pg.set_rotation(page.rotation)
+                self._subset_fonts(out_doc, self.pages)
+                save_pdf_atomic(out_doc, out)
+            finally:
+                out_doc.close()
+                for d in src_docs.values():
+                    d.close()
+        except FileLockedError:
+            self._st("⚠  Fichier ouvert dans un autre programme", warn=True)
+            messagebox.showerror(
+                "Fichier verrouillé",
+                f"Impossible de remplacer :\n{out}\n\n"
+                "Ce fichier est ouvert dans un autre programme (Adobe Reader, "
+                "navigateur, aperçu Windows…).\nFermez-le puis réessayez, "
+                "ou enregistrez sous un autre nom.")
+            return
         except Exception as e:
             self._st("⚠  Erreur lors de la fusion", warn=True)
             messagebox.showerror("Erreur de fusion", str(e))
+            return
+
+        nf = len({p.path for p in self.pages})
+        ne = sum(len(p.edits) for p in self.pages)
+        overwrote_source = any(same_file(p.path, out) for p in self.pages)
+        msg = (f"PDF exporté avec succès !\n\n"
+               f"Fichier : {out}\n"
+               f"Pages : {len(self.pages)}  ·  Sources : {nf}\n"
+               f"Édits appliqués : {ne}")
+        if overwrote_source:
+            msg += ("\n\nLe fichier chargé a été remplacé : la liste a été rechargée "
+                    "depuis le fichier enregistré pour continuer à le modifier.")
+            self._reload_from(out)
+        self._st(f"✔  Exporté — {len(self.pages)} pages, {ne} édits", ok=True)
+        messagebox.showinfo("Succès", msg)
+
+    def _reload_from(self, path):
+        # The saved file already contains every edit: start again from it so that
+        # the old edits (tied to the previous content) are not applied a second time.
+        self.pages = []
+        self._raw_thumbs = {}
+        self._selected = None
+        self._history = []
+        self._hist_idx = -1
+        self._generation += 1
+        self._load_thread([path])
 
     def _apply_edits(self, fitz_page, edits):
         apply_edits_to_page(fitz_page, edits)
@@ -1255,6 +1319,7 @@ class PageEditor:
         self.app = app
         self.pos = pos
         self.page = app.pages[pos]
+        self._generation = app._generation
         self.rotation = self.page.rotation
         self.edits = copy.deepcopy(self.page.edits)
         self._next_uid = max([(e.uid or 0) for e in self.edits], default=0) + 1
@@ -1277,7 +1342,7 @@ class PageEditor:
         self._families = None
         self._rot_handle = None
 
-        self._doc = fitz.open(self.page.path)
+        self._doc = open_pdf(self.page.path)
         self._fpg = self._doc[self.page.pg_idx]
         self._src_rot = self._fpg.rotation
         if self._src_rot:
@@ -2496,6 +2561,18 @@ class PageEditor:
     def _on_save(self):
         self._close_inline(True, render=False)
         self._prune()
+        pages = self.app.pages
+        if not (self._generation == self.app._generation and self.pos < len(pages)
+                and pages[self.pos].path == self.page.path
+                and pages[self.pos].pg_idx == self.page.pg_idx):
+            # the page list was reloaded/changed while this editor was open
+            messagebox.showwarning(
+                "Page introuvable",
+                "La liste des pages a changé depuis l'ouverture de l'éditeur "
+                "(fichier réenregistré ou page supprimée).\n"
+                "Rouvrez la page pour la modifier.", parent=self.win)
+            self._close()
+            return
         thumb = self._make_thumb() if self.edits else None
         self.app.on_editor_save(self.pos, self.rotation, self.edits, thumb)
         self._close()
@@ -2995,7 +3072,7 @@ class PrintDialog:
             text=f"Page {idx + 1} sur {len(self.app.pages)}")
         if HAS_FITZ and HAS_PIL:
             try:
-                doc = fitz.open(page.path)
+                doc = open_pdf(page.path)
                 fpg = doc[page.pg_idx]
                 mat = fitz.Matrix(0.8, 0.8)
                 pix = fpg.get_pixmap(matrix=mat, alpha=False)
@@ -3095,7 +3172,7 @@ class PrintDialog:
             for idx in pages_idx:
                 pg = self.app.pages[idx]
                 if pg.path not in src_docs:
-                    src_docs[pg.path] = fitz.open(pg.path)
+                    src_docs[pg.path] = open_pdf(pg.path)
                 src = src_docs[pg.path]
                 out_doc.insert_pdf(src, from_page=pg.pg_idx, to_page=pg.pg_idx)
                 new_pg = out_doc[-1]
