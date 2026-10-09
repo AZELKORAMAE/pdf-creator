@@ -524,7 +524,12 @@ def apply_edits_to_page(page, edits, cache=None):
                     n += 1
         if n:
             _apply_redactions(page)
-        inserted = set()
+        # Font resource names already on the page (e.g. fonts written by a previous
+        # session of the tool): reusing one would silently pick that old subset font.
+        taken = set()
+        for f in page.get_fonts(full=True):
+            taken.add(f[4])
+        inserted = {}
         for ed, (kind, value, font, key) in writes:
             origin = fitz.Point(ed.origin)
             morph = (origin, fitz.Matrix(ed.angle)) if ed.angle else None
@@ -536,13 +541,19 @@ def apply_edits_to_page(page, edits, cache=None):
                 if kind == "base14":
                     fontname = value
                 else:
-                    fontname = "F" + hashlib.md5(str(key).encode()).hexdigest()[:10]
-                    if fontname not in inserted:
+                    fontname = inserted.get(key)
+                    if fontname is None:
+                        base = "F" + hashlib.md5(str(key).encode()).hexdigest()[:8]
+                        fontname, n = base, 0
+                        while fontname in taken:
+                            n += 1
+                            fontname = f"{base}{n}"
                         if kind == "buffer":
                             page.insert_font(fontname=fontname, fontbuffer=value)
                         else:
                             page.insert_font(fontname=fontname, fontfile=value)
-                        inserted.add(fontname)
+                        inserted[key] = fontname
+                        taken.add(fontname)
                 page.insert_text(origin, ed.text, fontname=fontname, fontsize=ed.size,
                                  color=ed.color, lineheight=LINE_H, morph=morph)
             except Exception:
