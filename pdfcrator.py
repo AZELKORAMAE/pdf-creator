@@ -732,7 +732,7 @@ class PDFMergerPro:
         tk.Label(hdr, text="SAFRAN", font=("Helvetica", 17, "bold"),
                  fg=C["white"], bg=C["navy2"], padx=16).pack(side=tk.LEFT, anchor="w", pady=10)
         tk.Frame(hdr, bg=C["blue"], width=1).pack(side=tk.LEFT, fill=tk.Y, pady=12)
-        tk.Label(hdr, text="  PDF Merger Pro  ·  V2.2", font=("Helvetica", 12),
+        tk.Label(hdr, text="  PDF Merger Pro  ·  V3.0", font=("Helvetica", 12),
                  fg="#A8CCE8", bg=C["navy2"]).pack(side=tk.LEFT)
         tk.Button(hdr, text="⬇  Fusionner & Exporter", command=self.merge_pdfs,
                   font=("Helvetica", 9, "bold"), bg=C["orange"], fg=C["white"],
